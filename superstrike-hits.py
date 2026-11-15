@@ -27,8 +27,19 @@ def hap_level_to_raw(l): return (l - 1) * 4
 def hap_raw_to_level(b): return b // 4 + 1
 ACT_MIN, ACT_MAX = 1, 10
 HAP_MIN, HAP_MAX = 1, 6
+# Rapid trigger lives in the "x" byte: bits 7..2 = level 1..5, bit 0 = firmware flag that must be
+# preserved (observed x=0x09 -> level 2 + flag). Encoding from Solaar (PR #3132 + fix #3207),
+# tested there on real PRO X2 SUPERSTRIKE hardware. Level 0 is rejected by the firmware.
+def rt_level_to_raw(l, cur_x): return ((l & 0x3F) << 2) | (cur_x & 0x01)
+def rt_raw_to_level(b): return b >> 2
+RT_MIN, RT_MAX = 1, 5
+DPI_EXT_FEATURE_ID, DPI_FEATURE_ID, FEATURESET_ID = 0x2202, 0x2201, 0x0001
 
 class HidppError(Exception): pass
+
+HIDPP_ERRORS = {1: "UNKNOWN", 2: "INVALID_ARGUMENT", 3: "OUT_OF_RANGE", 4: "HW_ERROR", 5: "LOGITECH_INTERNAL",
+                6: "INVALID_FEATURE_INDEX", 7: "INVALID_FUNCTION_ID", 8: "BUSY (is G HUB/Solaar using it?)",
+                9: "UNSUPPORTED"}
 
 def sysfs_hid_id(name):
     try:
@@ -84,9 +95,15 @@ class Device:
                 try: data = os.read(self.fd, 64)
                 except (BlockingIOError, OSError): continue
                 if len(data) < 6 or data[1] != dev_idx: continue
+                # error frames: [rid][dev][0xFF][feat_idx][fn|swid][code]  (HID++ 2.0)
+                #               [rid][dev][0x8F][feat_idx][fn|swid][code]  (HID++ 1.0, e.g. empty receiver slot)
+                # check these BEFORE the swid test below: in an error frame byte 3 is the
+                # feature index, not fn|swid, so the old order silently dropped errors and
+                # every failed call waited out all retries (~2.4 s).
+                if data[2] in (0xFF, 0x8F) and data[3] == feat_idx and data[4] == ((fn << 4) | SWID):
+                    raise HidppError(f"hid++ error {data[5]} ({HIDPP_ERRORS.get(data[5], '?')}) "
+                                     f"feat=0x{feat_idx:02x} fn={fn}")
                 if (data[3] & 0x0F) != SWID: continue
-                if data[2] == 0xFF and (data[4] & 0x0F) == SWID:
-                    last_err = data[5]; break
                 if data[2] == feat_idx and (data[3] >> 4) == fn:
                     body = data[4:]
                     if want_byte0 is None or (body and body[0] == want_byte0):
@@ -137,10 +154,14 @@ def read_btn(dev, dev_idx, fidx, btn):
     rec = dev.request(dev_idx, fidx, 2, bytes([btn]), want_byte0=btn)
     return bytearray(rec[:4])  # [btn, act, x, hap]
 
-def set_button(dev, dev_idx, fidx, btn, act_raw=None, hap_raw=None):
+def set_button(dev, dev_idx, fidx, btn, act_raw=None, hap_raw=None, rt_level=None):
     rec = read_btn(dev, dev_idx, fidx, btn)
     if act_raw is not None: rec[1] = act_raw
     if hap_raw is not None: rec[3] = hap_raw
+    if rt_level is not None:
+        if not RT_MIN <= rt_level <= RT_MAX:
+            raise HidppError(f"rapid trigger must be {RT_MIN}..{RT_MAX}")
+        rec[2] = rt_level_to_raw(rt_level, rec[2])
     res = dev.request(dev_idx, fidx, 1, bytes(rec), want_byte0=btn)
     return res[:4]
 
@@ -148,19 +169,203 @@ def cmd_get(dev, dev_idx, fidx):
     for btn, label in ((0, "left "), (1, "right")):
         b = read_btn(dev, dev_idx, fidx, btn)
         print(f"  {label}: actuation L{act_raw_to_level(b[1])} (0x{b[1]:02x})  "
-              f"click-haptics L{hap_raw_to_level(b[3])} (0x{b[3]:02x})  [x=0x{b[2]:02x}]")
+              f"click-haptics L{hap_raw_to_level(b[3])} (0x{b[3]:02x})  "
+              f"rapid-trigger L{rt_raw_to_level(b[2])} [x=0x{b[2]:02x}]")
+
+def get_info(dev, dev_idx, fidx):
+    """0x1B0C fn0 getInfo -> raw bytes [00, nButtons, act_max, ?, ?, flags] (see PROTOCOL.md)."""
+    return bytes(dev.request(dev_idx, fidx, 0)[:6])
+
+def check_raw(name, val, maximum):
+    """Raw bytes must be a multiple of 4 (low 2 bits are reserved) and within the device max."""
+    if not 0 <= val <= maximum or val & 0x03:
+        raise HidppError(f"raw {name} 0x{val:02x} invalid: must be a multiple of 4 between 0x00 and 0x{maximum:02x}")
+
+# ---------------------------------------------------------------- feature table (read-only)
+FEATURE_NAMES = {0x0000: "IRoot", 0x0001: "IFeatureSet", 0x0003: "device info / fw", 0x0005: "device name & type",
+                 0x1D4B: "wireless device status", 0x0020: "config change", 0x1004: "unified battery",
+                 0x2201: "adjustable DPI", 0x2202: "extended adjustable DPI", 0x1B0C: "analog / HITS",
+                 0x8060: "report rate", 0x8061: "extended report rate", 0x8100: "onboard profiles",
+                 0x8110: "mouse button spy", 0x1805: "OOB state", 0x1830: "power modes",
+                 0x1E00: "enable hidden features"}
+
+def dump_features(dev, dev_idx):
+    """[(index, feature_id, type_flags, version)] via IFeatureSet. Only getCount/getFeatureID are called."""
+    fs = dev.get_feature_index(dev_idx, FEATURESET_ID)
+    count = dev.request(dev_idx, fs, 0)[0]
+    out = [(0, 0x0000, 0, 0)]
+    for i in range(1, count + 1):
+        b = dev.request(dev_idx, fs, 1, bytes([i]))
+        out.append((i, (b[0] << 8) | b[1], b[2], b[3]))
+    return out
+
+def cmd_dump_features(dev, dev_idx):
+    for i, fid, flags, ver in dump_features(dev, dev_idx):
+        tag = "  <<<<< analog / HITS" if fid == ANALOG_FEATURE_ID else ""
+        hid = " [hidden]" if flags & 0x40 else ""
+        print(f"  index 0x{i:02x} -> ID 0x{fid:04x}  v{ver}  {FEATURE_NAMES.get(fid, '')}{hid}{tag}")
+
+# ---------------------------------------------------------------- DPI (HID++ 0x2202, fallback 0x2201)
+# Wire formats from Solaar's settings_templates.py (ExtendedAdjustableDpi / AdjustableDpi / produce_dpi_list).
+LOD_NAMES = ("LOW", "MEDIUM", "HIGH")
+
+def find_dpi_feature(dev, dev_idx):
+    """-> (feature_id, feature_index) or (None, 0)."""
+    for fid in (DPI_EXT_FEATURE_ID, DPI_FEATURE_ID):
+        try:
+            idx = dev.get_feature_index(dev_idx, fid)
+        except HidppError:
+            idx = 0
+        if idx:
+            return fid, idx
+    return None, 0
+
+def _dpi_list(dev, dev_idx, didx, fn, skip, direction):
+    data = b""
+    for i in range(0x40):
+        data += bytes(dev.request(dev_idx, didx, fn, bytes([0, direction, i]))[skip:])
+        if data[-2:] == b"\x00\x00":
+            break
+    out, i = [], 0
+    while i + 1 < len(data):
+        v = (data[i] << 8) | data[i + 1]
+        if v == 0:
+            break
+        if v >> 13 == 0b111:  # range item: step, then last value
+            step, last = v & 0x1FFF, (data[i + 2] << 8) | data[i + 3]
+            if not out or step == 0 or last <= out[-1]:
+                raise HidppError("invalid DPI list from device")
+            out += list(range(out[-1] + step, last + 1, step))
+            i += 4
+        else:
+            out.append(v)
+            i += 2
+    return out
+
+def read_dpi(dev, dev_idx):
+    """-> dict(feature, x, y, lod, x_list, y_list, has_y, has_lod) or None if no DPI feature."""
+    fid, didx = find_dpi_feature(dev, dev_idx)
+    if not didx:
+        return None
+    if fid == DPI_EXT_FEATURE_ID:
+        caps = dev.request(dev_idx, didx, 1, bytes([0]))
+        has_y, has_lod = bool(caps[2] & 1), bool(caps[2] & 2)
+        xs = _dpi_list(dev, dev_idx, didx, 2, 3, 0)
+        ys = _dpi_list(dev, dev_idx, didx, 2, 3, 1) if has_y else None
+        r = dev.request(dev_idx, didx, 5, bytes([0]))
+        x = (r[1] << 8) | r[2]
+        y = ((r[5] << 8) | r[6]) if has_y else None
+        lod = r[9] if has_lod else None
+    else:  # 0x2201: one value for both axes
+        has_y = has_lod = False
+        xs, ys, y, lod = _dpi_list(dev, dev_idx, didx, 1, 1, 0), None, None, None
+        r = dev.request(dev_idx, didx, 2, bytes([0]))
+        x = (r[1] << 8) | r[2] or (r[3] << 8) | r[4]  # 0 -> use default dpi
+    return dict(feature=fid, x=x, y=y, lod=lod, x_list=xs, y_list=ys, has_y=has_y, has_lod=has_lod)
+
+def nearest_dpi(choices, want):
+    return min(choices, key=lambda v: abs(v - want))
+
+def set_dpi(dev, dev_idx, x, y=None, lod=None):
+    """Range-checked: x/y must be exact values from the mouse's own list (use nearest_dpi to snap)."""
+    info = read_dpi(dev, dev_idx)
+    if info is None:
+        raise HidppError("this device has no DPI feature (0x2202 / 0x2201)")
+    fid, didx = find_dpi_feature(dev, dev_idx)
+    if x not in info["x_list"]:
+        raise HidppError(f"DPI {x} not allowed (range {info['x_list'][0]}..{info['x_list'][-1]}, "
+                         f"nearest {nearest_dpi(info['x_list'], x)})")
+    if fid == DPI_FEATURE_ID:
+        dev.request(dev_idx, didx, 3, bytes([0, x >> 8, x & 0xFF]))
+        return read_dpi(dev, dev_idx)
+    y = x if y is None else y
+    if info["has_y"] and y not in info["y_list"]:
+        raise HidppError(f"Y DPI {y} not allowed")
+    lod = info["lod"] if lod is None else lod
+    if info["has_lod"] and lod not in (0, 1, 2):
+        raise HidppError("LOD must be 0 (LOW), 1 (MEDIUM) or 2 (HIGH)")
+    p = bytes([0, x >> 8, x & 0xFF])
+    p += bytes([y >> 8, y & 0xFF]) if info["has_y"] else b"\x00\x00"
+    p += bytes([lod if info["has_lod"] else 0])
+    dev.request(dev_idx, didx, 6, p)
+    return read_dpi(dev, dev_idx)
+
+def fmt_dpi(info):
+    if info is None:
+        return "  DPI: not available (no 0x2202/0x2201 feature)"
+    s = f"  DPI: X {info['x']}"
+    if info["has_y"]: s += f"  Y {info['y']}"
+    if info["has_lod"] and info["lod"] is not None: s += f"  lift-off {LOD_NAMES[info['lod']]}"
+    return s + f"   (allowed {info['x_list'][0]}..{info['x_list'][-1]}, {len(info['x_list'])} values, feature 0x{info['feature']:04x})"
+
+# ---------------------------------------------------------------- persistence (--save / --apply)
+def read_config(dev, dev_idx, fidx):
+    cfg = {}
+    for btn in (0, 1):
+        b = read_btn(dev, dev_idx, fidx, btn)
+        cfg[("left", "right")[btn]] = {"actuation": act_raw_to_level(b[1]), "haptics": hap_raw_to_level(b[3]),
+                                       "rapid_trigger": rt_raw_to_level(b[2])}
+    try:
+        d = read_dpi(dev, dev_idx)
+    except HidppError:
+        d = None
+    if d:
+        cfg["dpi"] = {"x": d["x"], "y": d["y"], "lod": d["lod"]}
+    return cfg
+
+def save_config(dev, dev_idx, fidx, path=None):
+    cfg = read_config(dev, dev_idx, fidx)
+    path = path or CONF
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+    return path, cfg
+
+def apply_config(dev, dev_idx, fidx, cfg):
+    """Apply a config dict (keys are optional; old files without rapid_trigger/dpi still work)."""
+    for btn in (0, 1):
+        c = cfg.get(("left", "right")[btn], {})
+        if "actuation" in c and not ACT_MIN <= c["actuation"] <= ACT_MAX:
+            raise HidppError("actuation in config must be 1..10")
+        if "haptics" in c and not HAP_MIN <= c["haptics"] <= HAP_MAX:
+            raise HidppError("haptics in config must be 1..6")
+        set_button(dev, dev_idx, fidx, btn,
+                   act_raw=act_level_to_raw(c["actuation"]) if "actuation" in c else None,
+                   hap_raw=hap_level_to_raw(c["haptics"]) if "haptics" in c else None,
+                   rt_level=c.get("rapid_trigger"))
+    if cfg.get("dpi"):
+        d = cfg["dpi"]
+        set_dpi(dev, dev_idx, d["x"], d.get("y"), d.get("lod"))
 
 def main():
     ap = argparse.ArgumentParser(description="G PRO X2 SUPERSTRIKE click-haptics / actuation control (Linux)")
-    ap.add_argument("--get", action="store_true", help="read current per-button config")
-    ap.add_argument("--haptics", type=int, metavar="1-6", help="set click-haptics level")
+    ap.add_argument("--get", action="store_true", help="read current per-button config (+ DPI)")
+    ap.add_argument("--haptics", type=int, metavar="1-6", help="set click-haptics level (1 = off)")
     ap.add_argument("--actuation", type=int, metavar="1-10", help="set actuation-point level")
+    ap.add_argument("--rapid-trigger", type=int, metavar="1-5", help="set rapid-trigger level (1 = fastest reset)")
+    ap.add_argument("--raw-haptics", type=lambda v: int(v, 0), metavar="0xNN", help="set raw haptics byte (advanced)")
+    ap.add_argument("--raw-actuation", type=lambda v: int(v, 0), metavar="0xNN", help="set raw actuation byte (advanced)")
     ap.add_argument("--left", action="store_true", help="apply to the left main button only")
     ap.add_argument("--right", action="store_true", help="apply to the right main button only")
+    ap.add_argument("--dpi", type=int, metavar="N", help="set DPI (snapped to the nearest value the mouse allows)")
+    ap.add_argument("--dpi-y", type=int, metavar="N", help="separate Y-axis DPI (if the mouse supports it)")
+    ap.add_argument("--lod", choices=["low", "medium", "high"], help="lift-off distance (with 0x2202)")
+    ap.add_argument("--dpi-list", action="store_true", help="print every DPI value the mouse accepts")
+    ap.add_argument("--dump-features", action="store_true", help="print the whole HID++ feature table (self-check)")
     ap.add_argument("--device", help="explicit /dev/hidrawN (normally auto-detected)")
     ap.add_argument("--save", action="store_true", help="also remember the resulting config in ~/.config/superstrike-hits.conf")
     ap.add_argument("--apply", action="store_true", help="read the saved config and apply it (for a boot/connect hook)")
     args = ap.parse_args()
+
+    # validate before touching the device
+    if args.actuation is not None and not ACT_MIN <= args.actuation <= ACT_MAX:
+        raise SystemExit("actuation must be 1..10")
+    if args.haptics is not None and not HAP_MIN <= args.haptics <= HAP_MAX:
+        raise SystemExit("haptics must be 1..6")
+    if args.rapid_trigger is not None and not RT_MIN <= args.rapid_trigger <= RT_MAX:
+        raise SystemExit("rapid trigger must be 1..5")
+    if args.dpi is not None and not 1 <= args.dpi <= 0xFFFF:
+        raise SystemExit("dpi out of range")
 
     dev, dev_idx, fidx = find_device(args.device)
     try:
@@ -168,37 +373,58 @@ def main():
             if not os.path.exists(CONF):
                 print("no config file, skipping"); return
             cfg = json.load(open(CONF))
-            for btn in (0, 1):
-                key = ("left", "right")[btn]
-                c = cfg.get(key, {})
-                set_button(dev, dev_idx, fidx, btn,
-                           act_raw=act_level_to_raw(c["actuation"]) if "actuation" in c else None,
-                           hap_raw=hap_level_to_raw(c["haptics"]) if "haptics" in c else None)
+            apply_config(dev, dev_idx, fidx, cfg)
             print("applied config:", cfg); return
 
-        act_raw = act_level_to_raw(args.actuation) if args.actuation else None
-        hap_raw = hap_level_to_raw(args.haptics) if args.haptics else None
-        if args.actuation and not ACT_MIN <= args.actuation <= ACT_MAX:
-            raise SystemExit("actuation must be 1..10")
-        if args.haptics and not HAP_MIN <= args.haptics <= HAP_MAX:
-            raise SystemExit("haptics must be 1..6")
+        if args.dump_features:
+            cmd_dump_features(dev, dev_idx); return
+        if args.dpi_list:
+            d = read_dpi(dev, dev_idx)
+            print(fmt_dpi(d))
+            if d: print("  " + " ".join(map(str, d["x_list"])))
+            return
 
-        if act_raw is None and hap_raw is None and not args.save:
-            cmd_get(dev, dev_idx, fidx); return
+        act_raw = act_level_to_raw(args.actuation) if args.actuation is not None else None
+        hap_raw = hap_level_to_raw(args.haptics) if args.haptics is not None else None
+        if args.raw_actuation is not None or args.raw_haptics is not None:
+            info = get_info(dev, dev_idx, fidx)
+            if args.raw_actuation is not None:
+                check_raw("actuation", args.raw_actuation, info[2]); act_raw = args.raw_actuation
+            if args.raw_haptics is not None:
+                check_raw("haptics", args.raw_haptics, 0x14); hap_raw = args.raw_haptics
+        rt = args.rapid_trigger
+        changed = False
 
-        buttons = [0, 1] if not (args.left or args.right) else ([0] if args.left else []) + ([1] if args.right else [])
-        for btn in buttons:
-            out = set_button(dev, dev_idx, fidx, btn, act_raw, hap_raw)
-            print(f"  set {('left ', 'right')[btn]}: actuation L{act_raw_to_level(out[1])}  "
-                  f"click-haptics L{hap_raw_to_level(out[3])}  OK")
+        if act_raw is not None or hap_raw is not None or rt is not None:
+            buttons = [0, 1] if not (args.left or args.right) else ([0] if args.left else []) + ([1] if args.right else [])
+            for btn in buttons:
+                out = set_button(dev, dev_idx, fidx, btn, act_raw, hap_raw, rt)
+                print(f"  set {('left ', 'right')[btn]}: actuation L{act_raw_to_level(out[1])}  "
+                      f"click-haptics L{hap_raw_to_level(out[3])}  rapid-trigger L{rt_raw_to_level(out[2])}  OK")
+            changed = True
+
+        if args.dpi is not None or args.lod:
+            cur = read_dpi(dev, dev_idx)
+            if cur is None:
+                raise SystemExit("this device has no DPI feature")
+            x = nearest_dpi(cur["x_list"], args.dpi) if args.dpi is not None else cur["x"]
+            y = None
+            if cur["has_y"]:
+                y = nearest_dpi(cur["y_list"], args.dpi_y) if args.dpi_y is not None else x
+            lod = ("low", "medium", "high").index(args.lod) if args.lod else None
+            print(fmt_dpi(set_dpi(dev, dev_idx, x, y, lod)).replace("DPI:", "set DPI:"))
+            changed = True
+
+        if not changed and not args.save:
+            cmd_get(dev, dev_idx, fidx)
+            print(fmt_dpi(read_dpi(dev, dev_idx)))
+            return
 
         if args.save:
-            cfg = {}
-            for btn in (0, 1):
-                b = read_btn(dev, dev_idx, fidx, btn)
-                cfg[("left", "right")[btn]] = {"actuation": act_raw_to_level(b[1]), "haptics": hap_raw_to_level(b[3])}
-            json.dump(cfg, open(CONF, "w"), indent=2)
-            print("saved config ->", CONF, cfg)
+            path, cfg = save_config(dev, dev_idx, fidx)
+            print("saved config ->", path, cfg)
+    except HidppError as e:
+        raise SystemExit(f"ERROR: {e}")
     finally:
         dev.close()
 
