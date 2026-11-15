@@ -11,7 +11,7 @@ Hardened vs the original:
   * config persistence: --save / --apply  (+ ~/.config/superstrike-hits.conf)
     so a udev/systemd hook can re-apply settings on every connect.
 """
-import os, sys, glob, time, select, argparse, json
+import os, sys, glob, time, select, argparse, json, fcntl, contextlib
 
 VID, PID_RECEIVER = 0x046D, 0xC54D
 HIDPP_SHORT, HIDPP_LONG = 0x10, 0x11
@@ -129,6 +129,69 @@ class Device:
     def get_feature_index(self, dev_idx, fid):
         body = self.request(dev_idx, FEAT_IROOT, 0, bytes([fid >> 8, fid & 0xFF]))
         return body[0]
+
+
+# ---------------------------------------------------------------- device lock + reconnect notifications
+# The GUI/tray, the CLI and the background watcher (superstrike-watch) can all talk to the mouse. hidraw
+# gives every open fd a copy of every reply, so they would not block each other, but two programs writing
+# at the same moment could mix up replies. Every multi-step transaction therefore takes this lock.
+def lock_path():
+    rt = os.environ.get("XDG_RUNTIME_DIR")
+    if rt and os.path.isdir(rt):
+        return os.path.join(rt, "superstrike.lock")
+    d = os.path.expanduser("~/.cache/superstrike")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "device.lock")
+
+@contextlib.contextmanager
+def device_lock(timeout=15.0):
+    fd = os.open(lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
+    end = time.time() + timeout
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() > end:
+                    raise HidppError("mouse is busy (another superstrike program holds the device lock)")
+                time.sleep(0.05)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+WIRELESS_STATUS_FEATURE_ID = 0x1D4B
+
+def is_reconnect_notification(frame, status_feat_idx=None):
+    """True if a raw hidraw report says the mouse (re)connected and wants its settings again.
+
+    * HID++ 1.0 receiver notification 0x41 (device connection): [10 idx 41 proto flags wpid_lo wpid_hi];
+      the link is up when flags bit 6 (0x40) is clear (Solaar notifications.py, DJ_PAIRING).
+    * HID++ 2.0 feature 0x1D4B (wireless device status) event 0: [11 idx feat 00 status request reason];
+      request == 1 means "software reconfiguration needed" (Solaar notifications.py, WIRELESS_DEVICE_STATUS).
+      The feature index is per-device, so it must be known (resolved after the first connection).
+    """
+    f = bytes(frame)
+    if len(f) < 7 or f[0] not in (0x10, 0x11):
+        return False
+    if f[2] == 0x41 and f[0] == 0x10:
+        return not (f[4] & 0x40)
+    if status_feat_idx and f[2] == status_feat_idx and f[3] == 0x00 and len(f) >= 7:
+        return f[5] == 0x01
+    return False
+
+def hidpp_nodes():
+    """[/dev/hidrawN] for Logitech interfaces that carry HID++ (vendor page 0xFF00)."""
+    out = []
+    for p in sorted(glob.glob("/dev/hidraw*")):
+        n = os.path.basename(p)
+        hid = sysfs_hid_id(n)
+        if hid and hid[1] == VID and has_ff00(n):
+            out.append(p)
+    return out
 
 def find_device(explicit=None):
     if explicit:
@@ -551,7 +614,8 @@ def main():
             if not os.path.exists(CONF):
                 print("no config file, skipping"); return
             cfg = json.load(open(CONF))
-            apply_config(dev, dev_idx, fidx, cfg)
+            with device_lock():
+                apply_config(dev, dev_idx, fidx, cfg)
             print("applied config:", cfg); return
 
         if args.dump_features:

@@ -45,6 +45,7 @@ class FakeFirmware:
         # HID++ error 5 (LOGITECH_INTERNAL) - reproduces the PRO X3 report (feat 0x2202 fn 6 -> error 5)
         self.onboard_mode = 1
         self.calls = []
+        self.listeners = []  # extra "hidraw fds" that receive notifications (like the watcher's listener)
         self.t = threading.Thread(target=self.run, daemon=True)
         self.t.start()
 
@@ -57,6 +58,26 @@ class FakeFirmware:
             if not data:
                 return
             self.handle_frame(data)
+
+    def add_listener(self):
+        """Return a socket that receives this mouse's notifications (a second open of the hidraw node)."""
+        a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.listeners.append(b)
+        return a
+
+    def sleep_and_wake(self, kind="1d4b"):
+        """Simulate the real problem: mouse drops the link, comes back in onboard mode at the profile's values."""
+        self.onboard_mode = 1
+        self.dpi = [800, 800, 2]
+        self.rate_idx = 3
+        if kind == "none":
+            return
+        if kind == "1d4b":  # HID++ 2.0 wireless device status: status=1, request=1 (reconfigure), reason=1
+            frame = bytes([0x11, self.idx, self.features.index(0x1D4B), 0x00, 0x01, 0x01, 0x01])
+        else:  # HID++ 1.0 receiver 0x41 device connection, link established (flags bit 6 clear)
+            frame = bytes([0x10, self.idx, 0x41, 0x0C, 0x00, 0xBE, 0x40])
+        for l in self.listeners:
+            l.send(frame.ljust(20 if frame[0] == 0x11 else 7, b"\0"))
 
     def send(self, b):
         self.sock.send(b.ljust(20, b"\0"))

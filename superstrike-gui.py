@@ -1,18 +1,71 @@
 #!/usr/bin/env python3
-"""superstrike-gui - dark PySide6 front-end for superstrike-hits.py (Logitech G PRO X2 SUPERSTRIKE).
+"""superstrike-gui - dark PySide6 front-end for superstrike-hits.py (Logitech G PRO X2/X3 SUPERSTRIKE).
 
 Every device operation calls the functions in superstrike-hits.py (find_device, read_btn,
 set_button, get_info, dump_features, read_dpi/set_dpi, save_config/apply_config), so the
-GUI behaves exactly like the CLI.   Run:  superstrike-gui   [--mock]
+GUI behaves exactly like the CLI.
+Run:  superstrike-gui  [--tray] [--mock] [--diagnose]
+  --tray      start hidden in the system tray (used by the login autostart entry)
+  --diagnose  print a launcher/device/service report and exit (use this if the app-menu entry does nothing)
 """
-import glob, importlib.util, json, os, sys, traceback
+import glob, importlib.util, json, logging, logging.handlers, os, shutil, subprocess, sys, traceback
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal
-from PySide6.QtGui import QColor, QPalette
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFormLayout, QGridLayout, QGroupBox,
-                               QHBoxLayout, QHeaderView, QLabel, QMainWindow, QMessageBox, QPlainTextEdit,
-                               QPushButton, QSlider, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget,
-                               QVBoxLayout, QWidget)
+CACHE_DIR = os.path.expanduser("~/.cache/superstrike")
+LOG_FILE = os.path.join(CACHE_DIR, "gui.log")
+APP_ID = "superstrike-gui"
+log = logging.getLogger(APP_ID)
+
+
+def setup_logging():
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        h = logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=512 * 1024, backupCount=2)
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        log.addHandler(h)
+        log.setLevel(logging.INFO)
+    except OSError:
+        pass
+
+    def hook(et, ev, tb):
+        log.error("uncaught exception:\n%s", "".join(traceback.format_exception(et, ev, tb)))
+        sys.__excepthook__(et, ev, tb)
+
+    sys.excepthook = hook
+
+
+def notify_failure(msg):
+    """Visible error even when started from the app menu (no terminal)."""
+    log.error(msg)
+    print(msg, file=sys.stderr)
+    if os.environ.get("SUPERSTRIKE_WRAPPER"):
+        return  # the ~/.local/bin wrapper shows the notification (avoid two popups)
+    full = f"{msg}\n\nDetails: {LOG_FILE}\nRun 'superstrike-gui --diagnose' in a terminal."
+    for cmd in (["notify-send", "-a", "SUPERSTRIKE Control", "-i", "input-mouse", "SUPERSTRIKE Control failed to start", full],
+                ["kdialog", "--error", full, "--title", "SUPERSTRIKE Control"],
+                ["zenity", "--error", "--text", full]):
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+            except OSError:
+                pass
+
+
+try:
+    from PySide6.QtCore import QObject, QRunnable, QSettings, Qt, QThreadPool, QTimer, Signal
+    from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPalette, QPixmap
+    from PySide6.QtNetwork import QLocalServer, QLocalSocket
+    from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFormLayout, QGridLayout, QGroupBox,
+                                   QHBoxLayout, QHeaderView, QLabel, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
+                                   QPushButton, QSlider, QSpinBox, QSplitter, QSystemTrayIcon, QTableWidget,
+                                   QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
+    PYSIDE_ERROR = None
+except ImportError as _e:  # keep --diagnose usable without PySide6
+    PYSIDE_ERROR = _e
+    QObject = QRunnable = QMainWindow = QWidget = object
+
+    def Signal(*a):
+        return None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 AUTOAPPLY_FLAG = os.path.expanduser("~/.config/superstrike-hits.autoapply")
@@ -30,7 +83,77 @@ def load_backend():
     raise SystemExit("superstrike-hits.py not found next to superstrike-gui.py")
 
 
-be = load_backend()
+try:
+    be = load_backend()
+    BACKEND_ERROR = None
+except SystemExit as _e:
+    be, BACKEND_ERROR = None, str(_e)
+
+WATCH_UNIT = "superstrike-watch.service"
+APPLY_UNIT = "superstrike-apply.service"
+
+
+def config_home():
+    return os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+
+
+def autostart_file():
+    return os.path.join(config_home(), "autostart", "superstrike-gui.desktop")
+
+
+def launcher_cmd():
+    """Absolute command for this GUI (app menu entries and autostart must not depend on PATH)."""
+    wrapper = os.path.expanduser("~/.local/bin/superstrike-gui")
+    if os.path.exists(wrapper):
+        return wrapper
+    return f"{sys.executable} {os.path.abspath(__file__)}"
+
+
+def write_autostart(on):
+    f = autostart_file()
+    if on:
+        os.makedirs(os.path.dirname(f), exist_ok=True)
+        with open(f, "w") as fh:
+            fh.write("[Desktop Entry]\nType=Application\nName=SUPERSTRIKE Control (tray)\n"
+                     "Comment=Start SUPERSTRIKE Control minimized to the system tray\n"
+                     f"Exec={launcher_cmd()} --tray\nIcon=input-mouse\nTerminal=false\n"
+                     "X-GNOME-Autostart-enabled=true\nX-KDE-autostart-after=panel\n")
+    elif os.path.exists(f):
+        os.remove(f)
+
+
+def systemctl(*args, timeout=10):
+    """systemctl --user wrapper; returns (rc, output). Never raises."""
+    if not shutil.which("systemctl"):
+        return 127, "systemctl not found"
+    try:
+        r = subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return 1, str(e)
+
+
+def watch_status_file():
+    rt = os.environ.get("XDG_RUNTIME_DIR") or CACHE_DIR
+    return os.path.join(rt, "superstrike-watch.status")
+
+
+def tray_icon():
+    pm = QPixmap(64, 64)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setBrush(QColor("#0ea5e9"))
+    p.setPen(Qt.NoPen)
+    p.drawRoundedRect(4, 4, 56, 56, 16, 16)
+    p.setPen(QColor("#0b0d10"))
+    f = QFont()
+    f.setBold(True)
+    f.setPixelSize(40)
+    p.setFont(f)
+    p.drawText(pm.rect(), Qt.AlignCenter, "S")
+    p.end()
+    return QIcon(pm)
 
 DARK_QSS = """
 QWidget { background: #16181d; color: #e6e6e6; font-size: 10.5pt; }
@@ -58,6 +181,11 @@ QLabel#muted { color: #8b95a5; }
 QLabel#big { font-size: 15pt; font-weight: bold; }
 QLabel#value { color: #7dd3fc; font-weight: bold; min-width: 26px; }
 QStatusBar { background: #111318; color: #9aa4b2; }
+QMenu { background: #1c1f26; border: 1px solid #2c313a; padding: 4px; }
+QMenu::item { padding: 5px 22px; border-radius: 5px; }
+QMenu::item:selected { background: #0ea5e9; color: #0b0d10; }
+QMenu::item:disabled { color: #7dd3fc; font-weight: bold; }
+QMenu::separator { height: 1px; background: #2c313a; margin: 4px 8px; }
 """
 
 
@@ -76,7 +204,8 @@ class Job(QRunnable):
 
     def run(self):
         try:
-            res, err = self.fn(), None
+            with be.device_lock():
+                res, err = self.fn(), None
         except SystemExit as e:  # backend find_device() raises SystemExit with a helpful message
             res, err = None, str(e)
         except Exception as e:
@@ -110,9 +239,13 @@ class LevelSlider(QWidget):
 
 
 class Main(QMainWindow):
-    def __init__(self, mock=False):
+    def __init__(self, mock=False, systemctl_fn=None):
         super().__init__()
         self.mock = mock
+        self.systemctl = systemctl_fn or systemctl
+        self.settings = QSettings("superstrike", "superstrike-gui")
+        self._quitting = False
+        self._tray_hint_shown = False
         self.conn = None  # (dev, dev_idx, fidx)
         self.dpi = None
         self.pool = QThreadPool()
@@ -127,7 +260,7 @@ class Main(QMainWindow):
         self.tabs.addTab(self._hits_tab(), "Click (HITS)")
         self.tabs.addTab(self._dpi_tab(), "DPI")
         self.tabs.addTab(self._rate_tab(), "Polling rate")
-        self.tabs.addTab(self._config_tab(), "Saved config && auto-apply")
+        self.tabs.addTab(self._config_tab(), "Saved config && background")
         self.tabs.addTab(self._features_tab(), "Feature table")
         self.log = QPlainTextEdit(readOnly=True)
         self.log.setMaximumBlockCount(2000)
@@ -152,6 +285,12 @@ class Main(QMainWindow):
         split.setSizes([480, 150])
         v.addWidget(split, 1)
         self.setCentralWidget(root)
+        self.setWindowIcon(tray_icon())
+        self._make_tray()
+        self.refresh_service_status()
+        self._svc_timer = QTimer(self)
+        self._svc_timer.timeout.connect(self.refresh_service_status)
+        self._svc_timer.start(15000)
         self.connect_device()
 
     # ------------------------------------------------------------------ layout
@@ -382,6 +521,8 @@ class Main(QMainWindow):
                 self.rate_presets.addWidget(QLabel("(no 400 Hz in hardware)", objectName="muted"))
             self.rate_presets.addStretch(1)
             self.update_snap_label()
+            self._fill_rate_menu()
+            self.update_tray()
             self.say(be.fmt_rate(info).strip())
 
         self.run(lambda: be.read_rate(self.conn[0], self.conn[1]), ok)
@@ -409,10 +550,11 @@ class Main(QMainWindow):
         def ok(res):
             if res.get("switched_to_host"):
                 self.say("Switched the mouse to host mode so the polling rate can be changed "
-                         "(back to the onboard profile after power-off; enable auto-apply to keep it).")
+                         "(back to the onboard profile when the mouse sleeps; turn on 'Keep settings after sleep' to keep it).")
             self.say(f"Polling rate set to {res['hz']} Hz ✔")
             self.read_rate()
             self.read_dpi()
+            self.autosave()
 
         self.run(lambda: be.set_rate(self.conn[0], self.conn[1], hz, host_mode=host_mode), ok)
 
@@ -444,6 +586,41 @@ class Main(QMainWindow):
         lab.setWordWrap(True)
         b2.addWidget(lab)
         v.addWidget(box2)
+
+        box3 = QGroupBox("Keep settings after sleep")
+        b3 = QVBoxLayout(box3)
+        self.keep = QCheckBox("Keep settings after sleep (background service)")
+        self.keep.setToolTip("Runs superstrike-watch.service: when the mouse wakes up / reconnects or the PC resumes, "
+                             "it re-applies your saved config (host mode, DPI, polling rate, click settings).")
+        self.keep.clicked.connect(self.toggle_keep)
+        b3.addWidget(self.keep)
+        self.svc_lbl = QLabel("service: ?", objectName="muted")
+        self.svc_lbl.setWordWrap(True)
+        r3 = QHBoxLayout()
+        r3.addWidget(self.svc_lbl, 1)
+        rb = QPushButton("Refresh")
+        rb.clicked.connect(self.refresh_service_status)
+        r3.addWidget(rb)
+        b3.addLayout(r3)
+        lab = QLabel("Re-applies your saved config when the mouse wakes up/reconnects or the PC resumes "
+                     "(it otherwise falls back to its onboard profile, e.g. 800 DPI). Changes you apply are saved "
+                     "automatically while this is on.", objectName="muted")
+        lab.setWordWrap(True)
+        b3.addWidget(lab)
+        v.addWidget(box3)
+
+        box4 = QGroupBox("Tray")
+        b4 = QVBoxLayout(box4)
+        self.close_tray = QCheckBox("Closing the window keeps SUPERSTRIKE Control in the system tray")
+        self.close_tray.setChecked(self.settings.value("close_to_tray", True, type=bool))
+        self.close_tray.toggled.connect(lambda on: self.settings.setValue("close_to_tray", on))
+        b4.addWidget(self.close_tray)
+        self.login_tray = QCheckBox("Start minimized to tray at login")
+        self.login_tray.setChecked(os.path.exists(autostart_file()))
+        self.login_tray.toggled.connect(self.toggle_login_tray)
+        b4.addWidget(self.login_tray)
+        v.addWidget(box4)
+        v.addStretch(1)
         self.refresh_cfg_view()
         return w
 
@@ -462,6 +639,7 @@ class Main(QMainWindow):
 
     # ------------------------------------------------------------------ helpers
     def say(self, msg, err=False):
+        log.log(logging.ERROR if err else logging.INFO, msg)
         self.log.appendPlainText(("✖ " if err else "• ") + msg)
         self.statusBar().showMessage(msg.splitlines()[0], 8000)
 
@@ -473,12 +651,18 @@ class Main(QMainWindow):
         self.pool.start(job)
 
     def _done(self, res, err, cb):
+        if err and "write failed" in err and self.conn and not getattr(self, "_reconnecting", False):
+            self.say("The receiver went away (sleep/replug?) - reconnecting…")
+            self._reconnecting = True
+            self.connect_device()
+            return
         if err:
+            self._reconnecting = False
             if self.title.text() == "Searching…":
                 self.title.setText("No SUPERSTRIKE found")
                 self.sub.setText("Plug in the receiver, move the mouse to wake it, then press Connect")
             self.say(err, True)
-            if QApplication.platformName() not in ("offscreen", "minimal"):
+            if QApplication.platformName() not in ("offscreen", "minimal") and self.isVisible():
                 QMessageBox.warning(self, "SUPERSTRIKE", err)
             return
         cb(res)
@@ -516,6 +700,7 @@ class Main(QMainWindow):
             where = "wired / direct" if idx == 0xFF else f"wireless, slot {idx}"
             self.title.setText(name)
             self.sub.setText(f"{dev.path}  ·  {where}  ·  HITS feature index 0x{fidx:02x}")
+            self._reconnecting = False
             self.say(f"Connected to {name} on {dev.path}")
             self.read_hits()
             self.read_dpi()
@@ -563,6 +748,7 @@ class Main(QMainWindow):
         def ok(_):
             self.say("Saved click settings to the mouse ✔")
             self.read_hits()
+            self.autosave()
 
         self.run(work, ok)
 
@@ -608,6 +794,7 @@ class Main(QMainWindow):
                 b.setEnabled(info["x_list"][0] <= p <= info["x_list"][-1])
             cur = f"{info['x']}" + (f" × {info['y']}" if info["has_y"] and info["y"] != info["x"] else "")
             self.dpi_cur.setText(f"{cur} DPI")
+            self.update_tray()
             self.dpi_range.setText(f"allowed {info['x_list'][0]}–{info['x_list'][-1]} ({len(info['x_list'])} steps) "
                                    f"via HID++ 0x{info['feature']:04X}")
             self.say(be.fmt_dpi(info).strip())
@@ -639,7 +826,11 @@ class Main(QMainWindow):
         def ok(m):
             self._mode = m
             self.refresh_mode()
-            self.say(f"Profile mode is now: {m}" + ("  (DPI can be set; lost on power-off unless auto-apply is on)" if m == "host" else ""))
+            self.say(f"Profile mode is now: {m}" + ("  (DPI can be set; lost when the mouse sleeps unless 'Keep settings after sleep' is on)" if m == "host" else ""))
+            if m == "onboard" and self.keep.isChecked():
+                self.say("Note: 'Keep settings after sleep' is on, so the background service will switch the mouse "
+                         "back to host mode with your saved DPI/rate on the next wake-up. Turn it off to use the "
+                         "onboard profile.", True)
             self.read_dpi()
 
         self.run(work, ok)
@@ -664,9 +855,10 @@ class Main(QMainWindow):
         def ok(res):
             if res.get("switched_to_host"):
                 self.say("Switched the mouse from onboard-profile mode to host mode so DPI can be changed. "
-                         "It returns to the onboard profile after power-off; enable auto-apply to keep your DPI.")
+                         "It returns to the onboard profile when the mouse sleeps/reconnects; turn on 'Keep settings after sleep' (Saved config tab) to keep your DPI.")
             self.say(f"DPI set to {x}" + (f" / {y}" if y and y != x else "") + " ✔")
             self.read_dpi()
+            self.autosave()
 
         self.run(lambda: be.set_dpi(self.conn[0], self.conn[1], x, y, lod, host_mode=host_mode), ok)
 
@@ -705,6 +897,147 @@ class Main(QMainWindow):
         except OSError as e:
             self.say(f"Could not change auto-apply: {e}", True)
 
+    # ------------------------------------------------------------------ background service
+    def refresh_service_status(self):
+        _rc, enabled = self.systemctl("is-enabled", WATCH_UNIT, timeout=5)
+        _rc, active = self.systemctl("is-active", WATCH_UNIT, timeout=5)
+        enabled, active = enabled.splitlines()[-1] if enabled else "?", active.splitlines()[-1] if active else "?"
+        on = enabled == "enabled"
+        self.keep.setChecked(on)
+        txt = f"service: {active}, {enabled}"
+        try:
+            st = json.load(open(watch_status_file()))
+            txt += f" · watcher: {st.get('state')}"
+            la = st.get("last_apply")
+            if la:
+                import time as _t
+                txt += f" · last re-apply {_t.strftime('%H:%M:%S', _t.localtime(la['time']))} ({la['reason']})"
+            if st.get("last_error"):
+                txt += f" · last error: {st['last_error']}"
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        if enabled in ("not-found", "?") or "not found" in enabled or "No such file" in enabled:
+            txt = "service: not installed - run ./install.sh again"
+        self.svc_lbl.setText(txt)
+        return on, active
+
+    def toggle_keep(self, on):
+        if on and not os.path.exists(be.CONF):
+            if self.conn:
+                self.say("No saved config yet - saving the mouse's current settings first")
+                self.run(lambda: be.save_config(*self.conn), lambda r: (self.refresh_cfg_view(), self._set_keep(True)))
+                return
+            self.say("Save a config first (Saved config tab → Save)", True)
+            self.keep.setChecked(False)
+            return
+        self._set_keep(on)
+
+    def _set_keep(self, on):
+        rc, out = self.systemctl("enable" if on else "disable", "--now", WATCH_UNIT, timeout=20)
+        if rc != 0:
+            self.say(f"Could not {'enable' if on else 'disable'} {WATCH_UNIT}: {out or rc}", True)
+        else:
+            self.say(f"Keep settings after sleep: {'ON - the background service re-applies your saved config on wake/reconnect/resume' if on else 'off'}")
+        self.refresh_service_status()
+
+    def autosave(self):
+        """With the service on, the saved config is what gets restored, so keep it in sync with what the user set."""
+        if self.conn and self.keep.isChecked():
+            self.run(lambda: be.save_config(*self.conn),
+                     lambda r: (self.refresh_cfg_view(), log.info("auto-saved config for the background service")))
+
+    # ------------------------------------------------------------------ tray
+    def _make_tray(self):
+        self.tray_ok = QSystemTrayIcon.isSystemTrayAvailable() or bool(os.environ.get("SUPERSTRIKE_ASSUME_TRAY"))
+        self.tray = QSystemTrayIcon(tray_icon(), self)
+        self.tray.setToolTip("SUPERSTRIKE Control")
+        m = QMenu(self)
+        self.act_open = m.addAction("Open SUPERSTRIKE Control", self.show_window)
+        m.addSeparator()
+        self.act_status = m.addAction("Not connected")
+        self.act_status.setEnabled(False)
+        self.dpi_menu = m.addMenu("DPI")
+        for p in DPI_PRESETS:
+            self.dpi_menu.addAction(f"{p} DPI", lambda p=p: self.tray_dpi(p))
+        self.rate_menu = m.addMenu("Polling rate")
+        self._fill_rate_menu()
+        m.addSeparator()
+        self.act_reapply = m.addAction("Re-apply saved settings", self.apply_cfg)
+        m.addSeparator()
+        self.act_quit = m.addAction("Quit", self.quit_app)
+        self.tray_menu = m
+        self.tray.setContextMenu(m)
+        self.tray.activated.connect(self._tray_activated)
+        if self.tray_ok:
+            self.tray.show()
+
+    def _fill_rate_menu(self):
+        self.rate_menu.clear()
+        rates = (self.rate or {}).get("supported") if getattr(self, "rate", None) else None
+        for hz in rates or [125, 250, 500, 1000, 2000, 4000, 8000]:
+            a = self.rate_menu.addAction(f"{hz} Hz", lambda hz=hz: self.apply_rate(hz))
+            a.setCheckable(True)
+            a.setChecked(bool(self.rate) and self.rate.get("hz") == hz)
+
+    def update_tray(self):
+        parts = []
+        if self.dpi:
+            parts.append(f"{self.dpi['x']} DPI")
+        if getattr(self, "rate", None):
+            parts.append(f"{self.rate['hz']} Hz")
+        txt = " · ".join(parts) or ("Connected" if self.conn else "Not connected")
+        self.act_status.setText(txt)
+        self.tray.setToolTip(f"SUPERSTRIKE Control\n{txt}")
+        for a in self.dpi_menu.actions():
+            a.setCheckable(True)
+            a.setChecked(bool(self.dpi) and a.text() == f"{self.dpi['x']} DPI")
+
+    def tray_dpi(self, p):
+        if not self.dpi:
+            return self.say("DPI not available (not connected?)", True)
+        self.dpi_same.setChecked(True)
+        self.dpi_preset(p)
+
+    def _tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            if self.isVisible() and not self.isMinimized():
+                self.hide()
+            else:
+                self.show_window()
+
+    def show_window(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def quit_app(self):
+        self._quitting = True
+        self.tray.hide()
+        self.close()
+        QApplication.quit()
+
+    def closeEvent(self, ev):
+        if not self._quitting and self.tray_ok and self.close_tray.isChecked():
+            ev.ignore()
+            self.hide()
+            if not self._tray_hint_shown:
+                self._tray_hint_shown = True
+                self.tray.showMessage("SUPERSTRIKE Control", "Still running in the tray. Right-click the icon for "
+                                      "DPI/polling presets, or Quit.", QSystemTrayIcon.Information, 4000)
+            return
+        self._quitting = True
+        self.tray.hide()
+        ev.accept()
+        QApplication.quit()
+
+    def toggle_login_tray(self, on):
+        try:
+            write_autostart(on)
+            self.settings.setValue("start_tray_login", on)
+            self.say(f"Start minimized to tray at login: {'on (' + autostart_file() + ')' if on else 'off'}")
+        except OSError as e:
+            self.say(f"Could not change the login autostart entry: {e}", True)
+
     def toggle_trace(self, on):
         be.TRACE = self._trace_sig.line.emit if on else None
         self.say("Raw HID++ frame logging " + ("ON - reproduce the problem, then press Copy log" if on else "off"))
@@ -736,14 +1069,148 @@ def apply_dark(app):
     app.setStyleSheet(DARK_QSS)
 
 
-def main():
-    app = QApplication(sys.argv)
-    app.setApplicationName("superstrike-gui")
-    app.setDesktopFileName("superstrike-gui")
-    apply_dark(app)
-    w = Main(mock="--mock" in sys.argv)
-    w.show()
-    return app.exec()
+def diagnose(out=print):
+    """Plain-text report for when the app-menu entry does nothing. Needs no display and no PySide6."""
+    ok = lambda b: "OK  " if b else "FAIL"
+    out("SUPERSTRIKE Control diagnostics")
+    out(f"  python        {sys.executable} {sys.version.split()[0]}")
+    out(f"  PySide6       {ok(PYSIDE_ERROR is None)} {PYSIDE_ERROR or ''}"
+        + ("  -> sudo pacman -S pyside6" if PYSIDE_ERROR else ""))
+    if PYSIDE_ERROR is None:
+        import PySide6
+        out(f"                version {PySide6.__version__}")
+    out(f"  backend       {ok(be is not None)} {getattr(be, '__file__', BACKEND_ERROR)}")
+    out(f"  gui script    {os.path.abspath(__file__)}")
+    for k in ("XDG_SESSION_TYPE", "WAYLAND_DISPLAY", "DISPLAY", "QT_QPA_PLATFORM", "XDG_RUNTIME_DIR"):
+        out(f"  {k:<18}{os.environ.get(k, '(unset)')}")
+    bindir = os.path.expanduser("~/.local/bin")
+    out(f"  ~/.local/bin in PATH: {bindir in os.environ.get('PATH', '').split(':')}  "
+        "(the app menu does not use your fish/bash PATH, so the launcher uses an absolute path)")
+    wrapper = os.path.join(bindir, "superstrike-gui")
+    out(f"  wrapper       {ok(os.access(wrapper, os.X_OK))} {wrapper}")
+    for f in (os.path.expanduser("~/.local/share/applications/superstrike-gui.desktop"), autostart_file()):
+        if os.path.exists(f):
+            ex = [l.strip() for l in open(f) if l.startswith(("Exec=", "TryExec="))]
+            exe = ex[0].split("=", 1)[1].split()[0] if ex else ""
+            out(f"  desktop file  {f}")
+            out(f"                {' | '.join(ex)}  -> {ok(os.path.isabs(exe) and os.access(exe, os.X_OK))} absolute+executable")
+            if shutil.which("desktop-file-validate"):
+                r = subprocess.run(["desktop-file-validate", f], capture_output=True, text=True)
+                out(f"                desktop-file-validate: {ok(r.returncode == 0)} {(r.stdout + r.stderr).strip()}")
+        else:
+            out(f"  desktop file  (missing) {f}")
+    out(f"  log file      {LOG_FILE}{'' if os.path.exists(LOG_FILE) else ' (none yet)'}")
+    if os.path.exists(LOG_FILE):
+        tail = open(LOG_FILE, errors="replace").read().splitlines()[-8:]
+        for l in tail:
+            out(f"                | {l}")
+    if be is not None:
+        nodes = []
+        for p in sorted(glob.glob("/dev/hidraw*")):
+            n = os.path.basename(p)
+            hid = be.sysfs_hid_id(n)
+            if hid and hid[1] == be.VID:
+                nodes.append(p)
+                out(f"  hidraw        {p} 046d:{hid[2]:04x} HID++={be.has_ff00(n)} "
+                    f"read/write={ok(os.access(p, os.R_OK | os.W_OK))}")
+        if not nodes:
+            out("  hidraw        no Logitech hidraw nodes (receiver unplugged?)")
+    for r in ("42-logitech-superstrike.rules", "43-superstrike-autoapply.rules"):
+        out(f"  udev rule     {ok(os.path.exists('/etc/udev/rules.d/' + r))} /etc/udev/rules.d/{r}")
+    for u in (WATCH_UNIT, APPLY_UNIT):
+        _rc, en = systemctl("is-enabled", u, timeout=5)
+        _rc, ac = systemctl("is-active", u, timeout=5)
+        out(f"  {u:<27} enabled={en.splitlines()[-1] if en else '?'} active={ac.splitlines()[-1] if ac else '?'}")
+    try:
+        out(f"  watcher status {open(watch_status_file()).read().strip()}")
+    except OSError:
+        out("  watcher status (none)")
+    if be is not None:
+        out(f"  saved config  {be.CONF}: {open(be.CONF).read().strip() if os.path.exists(be.CONF) else '(none)'}")
+        try:
+            with be.device_lock(timeout=5):
+                dev, idx, fidx = be.find_device(None)
+                try:
+                    mode = be.get_onboard_mode(dev, idx)
+                    dpi = be.read_dpi(dev, idx)
+                    rate = be.read_rate(dev, idx)
+                finally:
+                    dev.close()
+            out(f"  mouse         OK   {dev.path} slot {idx:#x}, profile mode {mode}, "
+                f"DPI {dpi and dpi['x']}, rate {rate and rate['hz']} Hz")
+        except (SystemExit, Exception) as e:
+            out(f"  mouse         FAIL {e}")
+    return 0
+
+
+def _send_to_running(msg):
+    sock = QLocalSocket()
+    sock.connectToServer(f"{APP_ID}-{os.getuid()}")
+    if not sock.waitForConnected(500):
+        return False
+    sock.write(msg)
+    sock.flush()
+    sock.waitForBytesWritten(500)
+    sock.disconnectFromServer()
+    return True
+
+
+def start_single_instance_server(win):
+    name = f"{APP_ID}-{os.getuid()}"
+    srv = QLocalServer(win)
+    if not srv.listen(name):
+        QLocalServer.removeServer(name)  # stale socket from a crash
+        srv.listen(name)
+
+    def on_conn():
+        c = srv.nextPendingConnection()
+        if c is None:
+            return
+        c.waitForReadyRead(300)
+        data = bytes(c.readAll())
+        if b"show" in data:
+            win.show_window()
+        c.disconnectFromServer()
+
+    srv.newConnection.connect(on_conn)
+    win._ipc = srv
+    return srv
+
+
+def main(argv=None):
+    argv = sys.argv if argv is None else argv
+    setup_logging()
+    if "--diagnose" in argv:
+        return diagnose()
+    log.info("starting %s (argv %s, display %s/%s)", APP_ID, argv[1:], os.environ.get("WAYLAND_DISPLAY"),
+             os.environ.get("DISPLAY"))
+    if PYSIDE_ERROR is not None:
+        notify_failure(f"PySide6 is not installed ({PYSIDE_ERROR}). Install it with: sudo pacman -S pyside6")
+        return 2
+    if be is None:
+        notify_failure(BACKEND_ERROR)
+        return 2
+    try:
+        app = QApplication.instance() or QApplication(argv)
+        app.setApplicationName(APP_ID)
+        app.setDesktopFileName(APP_ID)
+        app.setQuitOnLastWindowClosed(False)  # the tray keeps us alive; Quit/closeEvent end the app
+        if "--no-single" not in argv and _send_to_running(b"tray" if "--tray" in argv else b"show"):
+            log.info("already running - asked the existing window to show itself")
+            print("SUPERSTRIKE Control is already running - raised the existing window.")
+            return 0
+        apply_dark(app)
+        w = Main(mock="--mock" in argv)
+        start_single_instance_server(w)
+        if "--tray" in argv and w.tray_ok:
+            log.info("started minimized to tray")
+        else:
+            w.show()
+        return app.exec()
+    except Exception as e:
+        log.exception("startup failed")
+        notify_failure(f"Startup failed: {e}")
+        return 1
 
 
 if __name__ == "__main__":

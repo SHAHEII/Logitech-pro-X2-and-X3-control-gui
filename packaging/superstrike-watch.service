@@ -1,0 +1,18 @@
+[Unit]
+Description=Keep Logitech SUPERSTRIKE settings after mouse sleep / reconnect / PC resume (superstrike-watch)
+Documentation=file://%h/.local/share/superstrike-hits/README.md
+ConditionPathExists=%h/.config/superstrike-hits.conf
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/share/superstrike-hits/superstrike-watch.py
+Restart=on-failure
+RestartSec=5
+# it only sleeps in select() on hidraw; keep it light
+Nice=10
+CPUQuota=10%
+MemoryMax=64M
+
+[Install]
+WantedBy=default.target
