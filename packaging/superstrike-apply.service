@@ -1,0 +1,13 @@
+[Unit]
+Description=Re-apply saved Logitech SUPERSTRIKE HITS/DPI settings (superstrike-hits --apply)
+ConditionPathExists=%h/.config/superstrike-hits.autoapply
+ConditionPathExists=%h/.config/superstrike-hits.conf
+
+[Service]
+Type=oneshot
+# give the receiver + mouse a moment to link up after plug-in / login
+ExecStartPre=/usr/bin/sleep 3
+ExecStart=%h/.local/bin/superstrike-hits --apply
+
+[Install]
+WantedBy=default.target

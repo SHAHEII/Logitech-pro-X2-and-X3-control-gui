@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=SUPERSTRIKE Control
+GenericName=Mouse settings
+Comment=Actuation, click haptics, rapid trigger and DPI for the Logitech G PRO X2 SUPERSTRIKE
+Exec=superstrike-gui
+Icon=input-mouse
+Terminal=false
+Categories=Settings;HardwareSettings;Qt;
+Keywords=logitech;mouse;superstrike;haptics;actuation;dpi;
+StartupWMClass=superstrike-gui

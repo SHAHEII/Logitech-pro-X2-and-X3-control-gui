@@ -57,6 +57,59 @@ applies them. Wire `--apply` to a udev/systemd hook so settings survive reboots 
 onboard profile being changed by Windows/G HUB. (See the repo wiki / issues for a sample
 systemd unit.)
 
+## GUI + CachyOS / Arch install (fork addition)
+
+This fork adds **`superstrike-gui.py`**, a dark PySide6 window built on the functions in
+`superstrike-hits.py`, so it behaves exactly like the CLI:
+
+| Tab | What you can do |
+|---|---|
+| **Click (HITS)** | per-button **actuation** (1–10), **click haptics** (1–6, 1 = off), **rapid trigger** (1–5); link both buttons; defaults; read back; apply. Advanced: write raw bytes (`--raw-actuation` / `--raw-haptics`), checked against the device max and the multiple-of-4 rule |
+| **DPI** | current DPI, allowed range read from the mouse, X / Y / lift-off distance, presets 400–6400, values snapped to the mouse's steps |
+| **Saved config & auto-apply** | `--save` / `--apply` with one click, view the saved file, switch auto-apply on connect or login on and off |
+| **Feature table** | `--dump-features` as a table (0x1B0C highlighted) |
+
+Also: device picker (`--device`), a log panel, and status and error messages. Mouse I/O runs in a background thread, so the window never freezes.
+
+### Install on CachyOS (fish is fine)
+
+```bash
+git clone <your fork URL> superstrike && cd superstrike   # or untar the release
+./install.sh            # sudo pacman -S python pyside6, udev rules, ~/.local/bin launchers, systemd user unit
+# unplug + replug the receiver once
+superstrike-gui         # or "SUPERSTRIKE Control" in the app menu
+superstrike-hits --get  # CLI still works the same
+```
+If `~/.local/bin` is not in your PATH, fish users run `fish_add_path ~/.local/bin`. To remove everything: `./install.sh --uninstall`.
+
+Try the GUI without a mouse: `python3 superstrike-gui.py --mock`.
+
+### New CLI options in this fork
+
+```bash
+./superstrike-hits.py --rapid-trigger 1            # 1 = fastest reset .. 5
+./superstrike-hits.py --dpi 1600                   # snapped to the nearest allowed value
+./superstrike-hits.py --dpi 1600 --dpi-y 1200 --lod low
+./superstrike-hits.py --dpi-list                   # every DPI the mouse accepts
+./superstrike-hits.py --dump-features              # documented in PROTOCOL.md, now implemented
+./superstrike-hits.py --raw-actuation 0x10 --raw-haptics 0x0c --left
+```
+
+Where these come from:
+* **Rapid trigger** is the `x` byte: `level << 2`, with bit 0 a firmware flag that is kept. The `0x09` seen in
+  PROTOCOL.md decodes to level 2 + flag. The encoding comes from Solaar (PR #3132 + fix #3207), which was tested on a real X2.
+* **DPI** uses HID++ `0x2202` (extended adjustable DPI, present on the X2), with a fallback to `0x2201`. Both use Solaar's wire format.
+* `--save` now also stores `rapid_trigger` and `dpi`. Old config files still apply.
+* Bug fix: HID++ error replies are now recognised. Before, every failed call waited about 2.4 s for retries.
+
+### PRO X3 SUPERSTRIKE?
+
+The X3 uses a new dongle **046d:c54f** (mouse WPID 40BE). According to Solaar PR #3352 (tested on a real X3),
+that dongle speaks HID++ 2.0 with the mouse at **device index 1**, and the same `0x1B0C` tuning works unchanged.
+This tool already tries index 1 first, on any Logitech hidraw node with the FF00 usage page. So the X3 *should*
+work as-is, but **nobody has tested it with this tool yet**. The fork only adds c54f to the udev permission and
+auto-apply rules. Nothing in the protocol code changed for it.
+
 ## How it works
 
 Full reverse-engineering notes and the exact HID++ protocol (feature `0x1B0C`, the
@@ -65,9 +118,9 @@ captured from G HUB) are in **[PROTOCOL.md](PROTOCOL.md)**.
 
 ## Status / TODO
 
-- [ ] Confirm the `x`/rapid-trigger sub-field semantics.
+- [x] `x` = rapid trigger (level<<2 | flag), exposed as `--rapid-trigger` (per Solaar's hardware-tested encoding).
 - [ ] Upstream as a libratbag device entry and/or a Solaar feature plugin for `0x1B0C`.
-- [ ] Packaged systemd/udev auto-apply.
+- [x] Packaged systemd/udev auto-apply (`install.sh`, toggle in the GUI).
 
 ## Credits
 

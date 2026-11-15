@@ -1,0 +1,5 @@
+# superstrike-gui auto-apply: when a SUPERSTRIKE receiver/dongle appears, ask the logged-in user's
+# systemd to start superstrike-apply.service (it only runs if auto-apply is switched on in the GUI,
+# i.e. ~/.config/superstrike-hits.autoapply exists, and a saved config exists).
+ACTION=="add", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c54d", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}+="superstrike-apply.service"
+ACTION=="add", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c54f", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}+="superstrike-apply.service"

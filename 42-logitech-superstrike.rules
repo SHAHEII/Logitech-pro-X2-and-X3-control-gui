@@ -6,5 +6,7 @@
 #
 # LIGHTSPEED receiver (wireless)
 KERNEL=="hidraw*", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c54d", MODE="0660", TAG+="uaccess"
+# PRO X3 SUPERSTRIKE LIGHTSPEED dongle (046d:c54f) - permission only (Solaar PR #3352 ID)
+KERNEL=="hidraw*", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c54f", MODE="0660", TAG+="uaccess"
 # Fallback: any Logitech hidraw (covers wired mode, where the product ID may differ)
 KERNEL=="hidraw*", ATTRS{idVendor}=="046d", MODE="0660", TAG+="uaccess"
