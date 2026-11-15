@@ -44,10 +44,24 @@ def main(shots=None):
     # raw (invalid then valid)
     w.raw_act.setValue(0x10); w.raw_hap.setValue(0x0C); w.raw_btn.setCurrentText("left"); w.apply_raw(); settle(app, w)
     assert fw.rec[0][0] == 0x10 and fw.rec[0][2] == 0x0C
-    # DPI
-    assert w.dpi and w.dpi["x"] == 800
+    # DPI - mouse starts in onboard mode (like the real X3); first try with auto-switch off -> error 5 shown
+    assert w.dpi and w.dpi["x"] == 800 and w.mode_lbl.text() == "mode: onboard"
+    w.auto_host.setChecked(False)
+    w.debug.setChecked(True)
+    w.dpi_preset(1600); settle(app, w)
+    log = w.log.toPlainText()
+    assert "hid++ error 5" in log and "onboard-profile mode" in log and fw.dpi[0] == 800
+    assert ">> 11 01 09 6" in log and "<< 11 01 ff 09 6" in log  # raw frames of the refused setSensorDpi
+    w.debug.setChecked(False)
+    if shots:
+        w.tabs.setCurrentIndex(1); settle(app, w); w.grab().save(os.path.join(shots, "screenshot-dpi-error5-before.png"))
+    # fixed path: auto host switch on
+    w.auto_host.setChecked(True)
     w.dpi_preset(1600); settle(app, w)
     assert fw.dpi[:2] == [1600, 1600], fw.dpi
+    assert fw.onboard_mode == 2 and w.mode_lbl.text() == "mode: host" and "Switched the mouse" in w.log.toPlainText()
+    w.set_mode("onboard"); settle(app, w); assert fw.onboard_mode == 1
+    w.set_mode("host"); settle(app, w); assert fw.onboard_mode == 2
     w.dpi_same.setChecked(False); w.dpi_x.setValue(3210); w.dpi_y.setValue(1234); w.lod.setCurrentIndex(0)
     w.apply_dpi(); settle(app, w)
     assert fw.dpi == [3200, 1250, 0], fw.dpi

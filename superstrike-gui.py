@@ -60,6 +60,10 @@ QStatusBar { background: #111318; color: #9aa4b2; }
 """
 
 
+class _TraceSig(QObject):
+    line = Signal(str)
+
+
 class _Sig(QObject):
     done = Signal(object, object, object)  # result, error, callback
 
@@ -113,7 +117,7 @@ class Main(QMainWindow):
         self.pool = QThreadPool()
         self.pool.setMaxThreadCount(1)  # one HID++ transaction at a time
         self.setWindowTitle("SUPERSTRIKE Control")
-        self.resize(820, 640)
+        self.resize(860, 800)
 
         root = QWidget()
         v = QVBoxLayout(root)
@@ -124,11 +128,26 @@ class Main(QMainWindow):
         self.tabs.addTab(self._config_tab(), "Saved config && auto-apply")
         self.tabs.addTab(self._features_tab(), "Feature table")
         self.log = QPlainTextEdit(readOnly=True)
-        self.log.setMaximumBlockCount(500)
+        self.log.setMaximumBlockCount(2000)
+        logbox = QWidget()
+        lv = QVBoxLayout(logbox)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lrow = QHBoxLayout()
+        self.debug = QCheckBox("Debug: log raw HID++ frames (>> sent, << received)")
+        self.debug.toggled.connect(self.toggle_trace)
+        copyb = QPushButton("Copy log")
+        copyb.clicked.connect(lambda: QApplication.clipboard().setText(self.log.toPlainText()))
+        lrow.addWidget(self.debug)
+        lrow.addStretch(1)
+        lrow.addWidget(copyb)
+        lv.addLayout(lrow)
+        lv.addWidget(self.log)
+        self._trace_sig = _TraceSig()
+        self._trace_sig.line.connect(lambda l: self.log.appendPlainText("   " + l))
         split = QSplitter(Qt.Vertical)
         split.addWidget(self.tabs)
-        split.addWidget(self.log)
-        split.setSizes([500, 110])
+        split.addWidget(logbox)
+        split.setSizes([480, 150])
         v.addWidget(split, 1)
         self.setCentralWidget(root)
         self.connect_device()
@@ -252,6 +271,29 @@ class Main(QMainWindow):
             self.preset_btns.append((p, b))
         f.addRow("Presets", pre)
         v.addWidget(box)
+        mbox = QGroupBox("Profile mode (HID++ 0x8100)")
+        mf = QVBoxLayout(mbox)
+        mrow = QHBoxLayout()
+        self.mode_lbl = QLabel("mode: -", objectName="value")
+        self.host_btn = QPushButton("Switch to host mode")
+        self.host_btn.clicked.connect(lambda: self.set_mode("host"))
+        self.onb_btn = QPushButton("Back to onboard profile")
+        self.onb_btn.clicked.connect(lambda: self.set_mode("onboard"))
+        mrow.addWidget(self.mode_lbl)
+        mrow.addStretch(1)
+        mrow.addWidget(self.host_btn)
+        mrow.addWidget(self.onb_btn)
+        mf.addLayout(mrow)
+        self.auto_host = QCheckBox("Switch to host mode automatically when applying DPI")
+        self.auto_host.setChecked(True)
+        mf.addWidget(self.auto_host)
+        mnote = QLabel("In <b>onboard</b> mode the mouse's stored profile owns DPI, and the mouse refuses DPI changes "
+                       "(HID++ error 5). <b>Host</b> mode lets this app set DPI, but the mouse goes back to its onboard "
+                       "profile when it powers off. Auto-apply (next tab) restores your DPI on every connect. "
+                       "Click (HITS) settings are stored on the mouse in both modes.", objectName="muted")
+        mnote.setWordWrap(True)
+        mf.addWidget(mnote)
+        v.addWidget(mbox)
         row = QHBoxLayout()
         r = QPushButton("Read from mouse")
         r.clicked.connect(self.read_dpi)
@@ -262,9 +304,7 @@ class Main(QMainWindow):
         row.addWidget(r)
         row.addWidget(a)
         v.addLayout(row)
-        note = QLabel("Values snap to the nearest step the mouse reports. If DPI jumps back after a reconnect, "
-                      "the onboard profile overrode it: enable auto-apply on the next tab.", objectName="muted")
-        note.setWordWrap(True)
+        note = QLabel("Values snap to the nearest step the mouse reports.", objectName="muted")
         v.addWidget(note)
         v.addStretch(1)
         return w
@@ -438,6 +478,7 @@ class Main(QMainWindow):
     def read_dpi(self):
         def ok(info):
             self.dpi = info
+            self.refresh_mode()
             if not info:
                 self.dpi_cur.setText("not supported")
                 return
@@ -463,7 +504,37 @@ class Main(QMainWindow):
                                    f"via HID++ 0x{info['feature']:04X}")
             self.say(be.fmt_dpi(info).strip())
 
-        self.run(lambda: be.read_dpi(self.conn[0], self.conn[1]), ok)
+        def work():
+            info = be.read_dpi(self.conn[0], self.conn[1])
+            mode = be.get_onboard_mode(self.conn[0], self.conn[1])
+            if info is not None:
+                info = dict(info, mode=mode)
+            self._show_mode(mode)
+            return info
+
+        self.run(work, ok)
+
+    def _show_mode(self, mode):
+        self._mode = mode
+        # (called from the worker; widgets are updated in refresh_mode on the GUI thread)
+
+    def refresh_mode(self):
+        mode = getattr(self, "_mode", None)
+        self.mode_lbl.setText(f"mode: {mode or 'not supported'}")
+        self.host_btn.setEnabled(mode == "onboard")
+        self.onb_btn.setEnabled(mode == "host")
+
+    def set_mode(self, mode):
+        def work():
+            return be.set_onboard_mode(self.conn[0], self.conn[1], mode)
+
+        def ok(m):
+            self._mode = m
+            self.refresh_mode()
+            self.say(f"Profile mode is now: {m}" + ("  (DPI can be set; lost on power-off unless auto-apply is on)" if m == "host" else ""))
+            self.read_dpi()
+
+        self.run(work, ok)
 
     def dpi_preset(self, p):
         self.dpi_x.setValue(p)
@@ -480,8 +551,16 @@ class Main(QMainWindow):
         if info["has_y"]:
             y = x if self.dpi_same.isChecked() else be.nearest_dpi(info["y_list"], self.dpi_y.value())
         lod = self.lod.currentIndex() if info["has_lod"] else None
-        self.run(lambda: be.set_dpi(self.conn[0], self.conn[1], x, y, lod),
-                 lambda _: (self.say(f"DPI set to {x}" + (f" / {y}" if y and y != x else "") + " ✔"), self.read_dpi()))
+        host_mode = "auto" if self.auto_host.isChecked() else "never"
+
+        def ok(res):
+            if res.get("switched_to_host"):
+                self.say("Switched the mouse from onboard-profile mode to host mode so DPI can be changed. "
+                         "It returns to the onboard profile after power-off; enable auto-apply to keep your DPI.")
+            self.say(f"DPI set to {x}" + (f" / {y}" if y and y != x else "") + " ✔")
+            self.read_dpi()
+
+        self.run(lambda: be.set_dpi(self.conn[0], self.conn[1], x, y, lod, host_mode=host_mode), ok)
 
     def refresh_cfg_view(self):
         try:
@@ -516,6 +595,10 @@ class Main(QMainWindow):
             self.say(f"Auto-apply {'enabled' if on else 'disabled'}")
         except OSError as e:
             self.say(f"Could not change auto-apply: {e}", True)
+
+    def toggle_trace(self, on):
+        be.TRACE = self._trace_sig.line.emit if on else None
+        self.say("Raw HID++ frame logging " + ("ON - reproduce the problem, then press Copy log" if on else "off"))
 
     def dump(self):
         def ok(rows):

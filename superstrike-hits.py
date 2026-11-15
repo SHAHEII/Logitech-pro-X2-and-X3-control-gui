@@ -35,7 +35,17 @@ def rt_raw_to_level(b): return b >> 2
 RT_MIN, RT_MAX = 1, 5
 DPI_EXT_FEATURE_ID, DPI_FEATURE_ID, FEATURESET_ID = 0x2202, 0x2201, 0x0001
 
-class HidppError(Exception): pass
+class HidppError(Exception):
+    def __init__(self, msg, code=None):
+        super().__init__(msg)
+        self.code = code  # HID++ error code from the device, if any
+
+# --trace / GUI debug toggle: set to a callable(str) to see every raw HID++ frame
+TRACE = None
+
+def _trace(direction, data):
+    if TRACE:
+        TRACE(f"{direction} {bytes(data).hex(' ')}")
 
 HIDPP_ERRORS = {1: "UNKNOWN", 2: "INVALID_ARGUMENT", 3: "OUT_OF_RANGE", 4: "HW_ERROR", 5: "LOGITECH_INTERNAL",
                 6: "INVALID_FEATURE_INDEX", 7: "INVALID_FUNCTION_ID", 8: "BUSY (is G HUB/Solaar using it?)",
@@ -84,6 +94,7 @@ class Device:
         for _ in range(tries):
             self._drain()
             try:
+                _trace(">>", pkt)
                 os.write(self.fd, pkt)
             except OSError as e:
                 # wrong interface (e.g. BrokenPipe): treat as no-such-device here
@@ -94,6 +105,7 @@ class Device:
                 if not r: continue
                 try: data = os.read(self.fd, 64)
                 except (BlockingIOError, OSError): continue
+                _trace("<<", data)
                 if len(data) < 6 or data[1] != dev_idx: continue
                 # error frames: [rid][dev][0xFF][feat_idx][fn|swid][code]  (HID++ 2.0)
                 #               [rid][dev][0x8F][feat_idx][fn|swid][code]  (HID++ 1.0, e.g. empty receiver slot)
@@ -102,7 +114,7 @@ class Device:
                 # every failed call waited out all retries (~2.4 s).
                 if data[2] in (0xFF, 0x8F) and data[3] == feat_idx and data[4] == ((fn << 4) | SWID):
                     raise HidppError(f"hid++ error {data[5]} ({HIDPP_ERRORS.get(data[5], '?')}) "
-                                     f"feat=0x{feat_idx:02x} fn={fn}")
+                                     f"feat=0x{feat_idx:02x} fn={fn}", code=data[5])
                 if (data[3] & 0x0F) != SWID: continue
                 if data[2] == feat_idx and (data[3] >> 4) == fn:
                     body = data[4:]
@@ -266,7 +278,35 @@ def read_dpi(dev, dev_idx):
 def nearest_dpi(choices, want):
     return min(choices, key=lambda v: abs(v - want))
 
-def set_dpi(dev, dev_idx, x, y=None, lod=None):
+# ---------------------------------------------------------------- onboard profiles mode (HID++ 0x8100)
+# Gaming mice run from an onboard profile by default ("onboard mode"). In that mode the profile owns
+# DPI / report rate, and a direct 0x2202 setSensorDpi is refused (seen on a real PRO X3 SUPERSTRIKE:
+# HID++ error 5). Solaar's docs say the same ("may need Onboard Profiles set to Disable"), and
+# libratbag never sends 0x2202 set while 0x8100 is present (it edits the profile instead).
+# Mode codes from Solaar's OnboardProfiles setting: fn1 setMode(1=onboard, 2=host), fn2 getMode.
+ONBOARD_FEATURE_ID = 0x8100
+MODE_ONBOARD, MODE_HOST = 0x01, 0x02
+
+def get_onboard_mode(dev, dev_idx):
+    """-> 'onboard', 'host', or None if the device has no 0x8100."""
+    try:
+        oidx = dev.get_feature_index(dev_idx, ONBOARD_FEATURE_ID)
+    except HidppError:
+        return None
+    if not oidx:
+        return None
+    m = dev.request(dev_idx, oidx, 2)[0]
+    return "onboard" if m == MODE_ONBOARD else "host" if m == MODE_HOST else f"unknown({m})"
+
+def set_onboard_mode(dev, dev_idx, mode):
+    """mode: 'host' (software controls DPI; not kept across power cycles) or 'onboard' (profile controls DPI)."""
+    oidx = dev.get_feature_index(dev_idx, ONBOARD_FEATURE_ID)
+    if not oidx:
+        raise HidppError("this device has no onboard profiles feature (0x8100)")
+    dev.request(dev_idx, oidx, 1, bytes([MODE_HOST if mode == "host" else MODE_ONBOARD]))
+    return get_onboard_mode(dev, dev_idx)
+
+def set_dpi(dev, dev_idx, x, y=None, lod=None, host_mode="auto"):
     """Range-checked: x/y must be exact values from the mouse's own list (use nearest_dpi to snap)."""
     info = read_dpi(dev, dev_idx)
     if info is None:
@@ -276,8 +316,11 @@ def set_dpi(dev, dev_idx, x, y=None, lod=None):
         raise HidppError(f"DPI {x} not allowed (range {info['x_list'][0]}..{info['x_list'][-1]}, "
                          f"nearest {nearest_dpi(info['x_list'], x)})")
     if fid == DPI_FEATURE_ID:
-        dev.request(dev_idx, didx, 3, bytes([0, x >> 8, x & 0xFF]))
-        return read_dpi(dev, dev_idx)
+        switched = _ensure_host_mode(dev, dev_idx, host_mode)
+        _dpi_write(dev, dev_idx, didx, 3, bytes([0, x >> 8, x & 0xFF]))
+        out = read_dpi(dev, dev_idx)
+        out["switched_to_host"] = switched
+        return out
     y = x if y is None else y
     if info["has_y"] and y not in info["y_list"]:
         raise HidppError(f"Y DPI {y} not allowed")
@@ -287,8 +330,29 @@ def set_dpi(dev, dev_idx, x, y=None, lod=None):
     p = bytes([0, x >> 8, x & 0xFF])
     p += bytes([y >> 8, y & 0xFF]) if info["has_y"] else b"\x00\x00"
     p += bytes([lod if info["has_lod"] else 0])
-    dev.request(dev_idx, didx, 6, p)
-    return read_dpi(dev, dev_idx)
+    switched = _ensure_host_mode(dev, dev_idx, host_mode)
+    _dpi_write(dev, dev_idx, didx, 6, p)
+    out = read_dpi(dev, dev_idx)
+    out["switched_to_host"] = switched
+    return out
+
+def _ensure_host_mode(dev, dev_idx, host_mode):
+    """host_mode='auto': leave onboard mode first if needed (returns True if it switched). 'never': don't."""
+    if host_mode != "auto":
+        return False
+    if get_onboard_mode(dev, dev_idx) == "onboard":
+        set_onboard_mode(dev, dev_idx, "host")
+        return True
+    return False
+
+def _dpi_write(dev, dev_idx, didx, fn, p):
+    try:
+        dev.request(dev_idx, didx, fn, p)
+    except HidppError as e:
+        if e.code == 5 and get_onboard_mode(dev, dev_idx) == "onboard":
+            raise HidppError(f"{e} - the mouse is in onboard-profile mode, which owns DPI. "
+                             "Switch to host mode (GUI button, or --onboard host) and retry.", code=5)
+        raise
 
 def fmt_dpi(info):
     if info is None:
@@ -351,6 +415,11 @@ def main():
     ap.add_argument("--dpi-y", type=int, metavar="N", help="separate Y-axis DPI (if the mouse supports it)")
     ap.add_argument("--lod", choices=["low", "medium", "high"], help="lift-off distance (with 0x2202)")
     ap.add_argument("--dpi-list", action="store_true", help="print every DPI value the mouse accepts")
+    ap.add_argument("--onboard", choices=["status", "host", "onboard"],
+                    help="show / switch onboard-profile mode (host = software controls DPI until power-off)")
+    ap.add_argument("--no-host-switch", action="store_true",
+                    help="with --dpi: do NOT leave onboard-profile mode automatically")
+    ap.add_argument("--trace", action="store_true", help="print every raw HID++ frame (for bug reports)")
     ap.add_argument("--dump-features", action="store_true", help="print the whole HID++ feature table (self-check)")
     ap.add_argument("--device", help="explicit /dev/hidrawN (normally auto-detected)")
     ap.add_argument("--save", action="store_true", help="also remember the resulting config in ~/.config/superstrike-hits.conf")
@@ -367,8 +436,17 @@ def main():
     if args.dpi is not None and not 1 <= args.dpi <= 0xFFFF:
         raise SystemExit("dpi out of range")
 
+    global TRACE
+    if args.trace:
+        TRACE = lambda line: print("  " + line, file=sys.stderr)
     dev, dev_idx, fidx = find_device(args.device)
     try:
+        if args.onboard:
+            if args.onboard != "status":
+                set_onboard_mode(dev, dev_idx, args.onboard)
+            print("onboard-profile mode:", get_onboard_mode(dev, dev_idx) or "not supported")
+            if not (args.dpi or args.lod or args.actuation or args.haptics or args.rapid_trigger):
+                return
         if args.apply:
             if not os.path.exists(CONF):
                 print("no config file, skipping"); return
@@ -412,12 +490,17 @@ def main():
             if cur["has_y"]:
                 y = nearest_dpi(cur["y_list"], args.dpi_y) if args.dpi_y is not None else x
             lod = ("low", "medium", "high").index(args.lod) if args.lod else None
-            print(fmt_dpi(set_dpi(dev, dev_idx, x, y, lod)).replace("DPI:", "set DPI:"))
+            res = set_dpi(dev, dev_idx, x, y, lod, host_mode="never" if args.no_host_switch else "auto")
+            if res.get("switched_to_host"):
+                print("  note: switched the mouse from onboard-profile mode to host mode so DPI can be set.\n"
+                      "        Host mode is lost when the mouse powers off; use --save + auto-apply to restore it.")
+            print(fmt_dpi(res).replace("DPI:", "set DPI:"))
             changed = True
 
         if not changed and not args.save:
             cmd_get(dev, dev_idx, fidx)
             print(fmt_dpi(read_dpi(dev, dev_idx)))
+            print("  onboard-profile mode:", get_onboard_mode(dev, dev_idx) or "not supported")
             return
 
         if args.save:

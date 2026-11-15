@@ -112,3 +112,38 @@ def test_cli_help():
         assert opt in out
     r = subprocess.run([sys.executable, os.path.join(root, "superstrike-hits.py"), "--haptics", "7"], capture_output=True, text=True)
     assert r.returncode != 0 and "haptics must be 1..6" in r.stderr
+
+
+def test_x3_dpi_error5_reproduced_and_fixed(m):
+    """PRO X3 report: 'hid++ error 5 (LOGITECH_INTERNAL) feat=0x1d fn=6' when applying DPI 1600/1600/HIGH."""
+    be, dev, i, f, fw = m
+    assert be.get_onboard_mode(dev, i) == "onboard"
+    didx = dev.get_feature_index(i, 0x2202)
+    payload = bytes([0x00, 0x06, 0x40, 0x06, 0x40, 0x02])  # sensor 0, X=1600, Y=1600 (BE), LOD byte as read
+    # old behaviour: the raw write in onboard mode is refused with error 5
+    with pytest.raises(be.HidppError) as e:
+        dev.request(i, didx, 6, payload)
+    assert e.value.code == 5
+    # without auto host switch, the error now explains what to do
+    with pytest.raises(be.HidppError, match="onboard-profile mode"):
+        be.set_dpi(dev, i, 1600, 1600, 2, host_mode="never")
+    # fixed: leave onboard mode first, then write the same Solaar-layout payload
+    res = be.set_dpi(dev, i, 1600, 1600, 2)
+    assert res["switched_to_host"] and res["x"] == 1600 and be.get_onboard_mode(dev, i) == "host"
+    sent = [c for c in fw.calls if c[0] == 0x2202 and c[1] == 6][-1][2][:6]
+    assert sent == payload
+    # second set: already in host mode, no further switch
+    assert be.set_dpi(dev, i, 800)["switched_to_host"] is False
+    # and back to onboard
+    assert be.set_onboard_mode(dev, i, "onboard") == "onboard"
+
+
+def test_trace_hook(m):
+    be, dev, i, f, fw = m
+    lines = []
+    be.TRACE = lines.append
+    try:
+        be.read_btn(dev, i, f, 0)
+    finally:
+        be.TRACE = None
+    assert lines[0].startswith(">> 11 01 0c 2") and any(l.startswith("<< 11 01 0c 2") for l in lines)

@@ -84,6 +84,21 @@ If `~/.local/bin` is not in your PATH, fish users run `fish_add_path ~/.local/bi
 
 Try the GUI without a mouse: `python3 superstrike-gui.py --mock`.
 
+### DPI says "hid++ error 5 (LOGITECH_INTERNAL) … fn=6"?
+
+That's the mouse refusing DPI changes because it's in **onboard-profile mode**: its stored profile owns DPI.
+This was seen on a real PRO X3 SUPERSTRIKE. The fix switches the mouse to **host mode** (HID++ `0x8100` setMode 2,
+the same thing Solaar's "Onboard Profiles: Disabled" does) before writing DPI:
+
+* GUI: *DPI* tab → "Switch to host mode automatically when applying DPI" (on by default), or the
+  *Switch to host mode* / *Back to onboard profile* buttons.
+* CLI: `--dpi` switches automatically (`--no-host-switch` turns that off), and `--onboard status|host|onboard` shows or sets the mode.
+* Host mode is **lost when the mouse powers off or reconnects**. Save your settings and turn on auto-apply to restore them.
+  In host mode the onboard profile's button mapping and DPI stages don't apply. HITS click settings are kept in both modes.
+
+Still failing? Turn on the GUI's *Debug: log raw HID++ frames* box, try again, press *Copy log* and send it,
+or run `superstrike-hits --trace --dpi 1600 2> dpi-trace.txt`.
+
 ### New CLI options in this fork
 
 ```bash
@@ -92,6 +107,8 @@ Try the GUI without a mouse: `python3 superstrike-gui.py --mock`.
 ./superstrike-hits.py --dpi 1600 --dpi-y 1200 --lod low
 ./superstrike-hits.py --dpi-list                   # every DPI the mouse accepts
 ./superstrike-hits.py --dump-features              # documented in PROTOCOL.md, now implemented
+./superstrike-hits.py --onboard status             # onboard-profile vs host mode (host = DPI can be set)
+./superstrike-hits.py --trace --get                # print raw HID++ frames (for bug reports)
 ./superstrike-hits.py --raw-actuation 0x10 --raw-haptics 0x0c --left
 ```
 

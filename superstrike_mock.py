@@ -21,6 +21,11 @@ FEATURES = [0x0000, 0x0001, 0x0003, 0x0005, 0x1D4B, 0x0020, 0x1004, 0x2250, 0x22
             0x1B0C, 0x8061, 0x8100, 0x8110]
 
 
+class _Refuse(Exception):
+    def __init__(self, code):
+        self.code = code
+
+
 class FakeFirmware:
     def __init__(self, sock, dev_idx=1, name=b"PRO X2 SUPERSTRIKE", dpi_feature=0x2202):
         self.sock, self.idx, self.name = sock, dev_idx, name
@@ -29,6 +34,9 @@ class FakeFirmware:
             self.features = [f for f in FEATURES if f != 0x2202]
         self.rec = {0: [0x14, 0x09, 0x08], 1: [0x14, 0x09, 0x08], 2: [0x14, 0x09, 0x08]}  # act L5, x, hap L3
         self.dpi = [800, 800, 2]
+        # like a real gaming mouse: starts in onboard-profile mode, where direct DPI writes are refused with
+        # HID++ error 5 (LOGITECH_INTERNAL) - reproduces the PRO X3 report (feat 0x2202 fn 6 -> error 5)
+        self.onboard_mode = 1
         self.calls = []
         self.t = threading.Thread(target=self.run, daemon=True)
         self.t.start()
@@ -47,6 +55,13 @@ class FakeFirmware:
         self.sock.send(b.ljust(20, b"\0"))
 
     def handle_frame(self, d):
+        try:
+            return self._handle_frame(d)
+        except _Refuse as r:
+            rid, idx, fi, fnsw = d[0], d[1], d[2], d[3]
+            return self.send(bytes([0x11, idx, 0xFF, fi, fnsw, r.code]))
+
+    def _handle_frame(self, d):
         rid, idx, fi, fnsw, p = d[0], d[1], d[2], d[3], d[4:]
         if idx != self.idx:  # empty receiver slot -> HID++ 1.0 error 0x8F
             return self.send(bytes([0x10, idx, 0x8F, fi, fnsw, 0x09]))
@@ -100,6 +115,8 @@ class FakeFirmware:
                 x, y, lod = self.dpi
                 return struct.pack(">BHHHHB", 0, x, 0, y, 0, lod)
             if fn == 6:
+                if self.onboard_mode == 1:
+                    raise _Refuse(5)
                 _s, x, y, lod = struct.unpack(">BHHB", p[0:6])
                 if x % 50 or not 100 <= x <= 32000 or y % 50 or not 100 <= y <= 32000 or lod > 2:
                     raise ValueError
@@ -111,11 +128,21 @@ class FakeFirmware:
             if fn == 2:
                 return struct.pack(">BHH", 0, self.dpi[0], 800)
             if fn == 3:
+                if self.onboard_mode == 1:
+                    raise _Refuse(5)
                 x = (p[1] << 8) | p[2]
                 if x not in (200, 400, 800, 1600):
                     raise ValueError
                 self.dpi[0] = x
                 return b""
+        if fid == 0x8100:
+            if fn == 1:
+                if p[0] not in (1, 2):
+                    raise ValueError
+                self.onboard_mode = p[0]
+                return b""
+            if fn == 2:
+                return bytes([self.onboard_mode])
         return None
 
 
