@@ -22,7 +22,7 @@ that keeps your settings after the mouse sleeps. Works on **Arch / CachyOS** and
 
 1. Get the code:
    ```bash
-   git clone -b gui https://github.com/SHAHEII/Logitech-PRO-X2-SUPERSTRIKE-Linux-haptics-actuation-control-.git superstrike
+   git clone -b gui https://github.com/SHAHEII/Logitech-pro-X2-and-X3-control-gui.git superstrike
    cd superstrike
    ```
 2. Install (asks for your sudo password once, for `pacman -S python pyside6` and the udev rules):
@@ -57,7 +57,7 @@ that keeps your settings after the mouse sleeps. Works on **Arch / CachyOS** and
      inputs = {
        nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
        superstrike = {
-         url = "github:SHAHEII/Logitech-PRO-X2-SUPERSTRIKE-Linux-haptics-actuation-control-/gui";
+         url = "github:SHAHEII/Logitech-pro-X2-and-X3-control-gui/gui";
          inputs.nixpkgs.follows = "nixpkgs";
        };
      };
@@ -102,13 +102,13 @@ that keeps your settings after the mouse sleeps. Works on **Arch / CachyOS** and
 ```nix
 {
   imports = [
-    "${builtins.fetchTarball "https://github.com/SHAHEII/Logitech-PRO-X2-SUPERSTRIKE-Linux-haptics-actuation-control-/archive/gui.tar.gz"}/nix/nixos.nix"
+    "${builtins.fetchTarball "https://github.com/SHAHEII/Logitech-pro-X2-and-X3-control-gui/archive/gui.tar.gz"}/nix/nixos.nix"
   ];
   programs.superstrike.enable = true;
 }
 ```
 
-**Just try it** (any distro with Nix, no install): `nix run github:SHAHEII/Logitech-PRO-X2-SUPERSTRIKE-Linux-haptics-actuation-control-/gui`
+**Just try it** (any distro with Nix, no install): `nix run github:SHAHEII/Logitech-pro-X2-and-X3-control-gui/gui`
 (you still need the udev rule or root to access the mouse). Without a mouse: `nix run ... -- --mock`.
 
 The flake also has `packages.<system>.default`, `overlays.default` (adds `pkgs.superstrike`) and `nix flake check`,

@@ -91,7 +91,7 @@ stdenvNoCC.mkDerivation {
 
   meta = {
     description = "Actuation, haptics, rapid trigger, DPI and polling-rate control (CLI + GUI + tray) for the Logitech G PRO X2/X3 SUPERSTRIKE";
-    homepage = "https://github.com/SHAHEII/Logitech-PRO-X2-SUPERSTRIKE-Linux-haptics-actuation-control-";
+    homepage = "https://github.com/SHAHEII/Logitech-pro-X2-and-X3-control-gui";
     license = lib.licenses.mit;
     platforms = lib.platforms.linux;
     mainProgram = "superstrike-gui";
