@@ -9,6 +9,7 @@ BIN="$HOME/.local/bin"
 APPS="$HOME/.local/share/applications"
 UNITS="$HOME/.config/systemd/user"
 AUTOSTART="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/superstrike-gui.desktop"
+ICON="$HOME/.local/share/icons/hicolor/scalable/apps/superstrike-gui.svg"
 RULES=(42-logitech-superstrike.rules 43-superstrike-autoapply.rules)
 SUDO="${SUDO-sudo}"   # tests run with SUDO= and a fake HOME
 
@@ -17,7 +18,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   systemctl --user disable --now superstrike-watch.service 2>/dev/null || true
   systemctl --user disable superstrike-apply.service 2>/dev/null || true
   rm -rf "$DEST" "$BIN/superstrike-hits" "$BIN/superstrike-gui" "$BIN/superstrike-watch" \
-         "$APPS/superstrike-gui.desktop" "$AUTOSTART" \
+         "$APPS/superstrike-gui.desktop" "$AUTOSTART" "$ICON" \
          "$UNITS/superstrike-apply.service" "$UNITS/superstrike-watch.service" \
          "$HOME/.config/superstrike-hits.autoapply" "$HOME/.config/superstrike/superstrike-gui.conf"
   systemctl --user daemon-reload 2>/dev/null || true
@@ -46,6 +47,7 @@ chmod 755 "$BIN/superstrike-hits" "$BIN/superstrike-gui" "$BIN/superstrike-watch
 
 echo "==> app menu entry (absolute Exec path: the KDE menu does not use your shell PATH)"
 sed "s|@BIN@|$BIN|g" "$HERE/packaging/superstrike-gui.desktop" > "$APPS/superstrike-gui.desktop"
+install -Dm 644 "$HERE/packaging/superstrike-gui.svg" "$ICON"
 chmod 644 "$APPS/superstrike-gui.desktop"
 if command -v desktop-file-validate >/dev/null; then
   desktop-file-validate "$APPS/superstrike-gui.desktop" && echo "    desktop-file-validate: OK"

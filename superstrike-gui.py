@@ -103,9 +103,15 @@ def autostart_file():
 
 def launcher_cmd():
     """Absolute command for this GUI (app menu entries and autostart must not depend on PATH)."""
+    env = os.environ.get("SUPERSTRIKE_LAUNCHER")
+    if env:
+        return env
     wrapper = os.path.expanduser("~/.local/bin/superstrike-gui")
     if os.path.exists(wrapper):
-        return wrapper
+        return wrapper  # Arch/CachyOS install.sh
+    found = shutil.which("superstrike-gui")  # NixOS: /run/current-system/sw/bin/... (stable across updates)
+    if found and "/nix/store/" not in found:
+        return os.path.abspath(found)
     return f"{sys.executable} {os.path.abspath(__file__)}"
 
 
@@ -116,7 +122,7 @@ def write_autostart(on):
         with open(f, "w") as fh:
             fh.write("[Desktop Entry]\nType=Application\nName=SUPERSTRIKE Control (tray)\n"
                      "Comment=Start SUPERSTRIKE Control minimized to the system tray\n"
-                     f"Exec={launcher_cmd()} --tray\nIcon=input-mouse\nTerminal=false\n"
+                     f"Exec={launcher_cmd()} --tray\nIcon=superstrike-gui\nTerminal=false\n"
                      "X-GNOME-Autostart-enabled=true\nX-KDE-autostart-after=panel\n")
     elif os.path.exists(f):
         os.remove(f)
@@ -1087,13 +1093,22 @@ def diagnose(out=print):
     out(f"  ~/.local/bin in PATH: {bindir in os.environ.get('PATH', '').split(':')}  "
         "(the app menu does not use your fish/bash PATH, so the launcher uses an absolute path)")
     wrapper = os.path.join(bindir, "superstrike-gui")
-    out(f"  wrapper       {ok(os.access(wrapper, os.X_OK))} {wrapper}")
-    for f in (os.path.expanduser("~/.local/share/applications/superstrike-gui.desktop"), autostart_file()):
+    if os.path.exists("/etc/NIXOS"):
+        out(f"  NixOS         launcher {shutil.which('superstrike-gui')} (Nix package; ~/.local/bin is not used)")
+    else:
+        out(f"  wrapper       {ok(os.access(wrapper, os.X_OK))} {wrapper}")
+    desktop_files = [os.path.expanduser("~/.local/share/applications/superstrike-gui.desktop"), autostart_file()]
+    for d in os.environ.get("XDG_DATA_DIRS", "").split(":"):
+        f = os.path.join(d, "applications", "superstrike-gui.desktop")
+        if d and os.path.exists(f) and f not in desktop_files:
+            desktop_files.insert(0, f)  # NixOS: /run/current-system/sw/share/applications
+    for f in desktop_files:
         if os.path.exists(f):
             ex = [l.strip() for l in open(f) if l.startswith(("Exec=", "TryExec="))]
             exe = ex[0].split("=", 1)[1].split()[0] if ex else ""
             out(f"  desktop file  {f}")
-            out(f"                {' | '.join(ex)}  -> {ok(os.path.isabs(exe) and os.access(exe, os.X_OK))} absolute+executable")
+            good = (os.path.isabs(exe) and os.access(exe, os.X_OK)) or ("/share/applications" in f and shutil.which(exe))
+            out(f"                {' | '.join(ex)}  -> {ok(good)} launchable")
             if shutil.which("desktop-file-validate"):
                 r = subprocess.run(["desktop-file-validate", f], capture_output=True, text=True)
                 out(f"                desktop-file-validate: {ok(r.returncode == 0)} {(r.stdout + r.stderr).strip()}")

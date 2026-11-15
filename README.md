@@ -1,4 +1,129 @@
-# superstrike-hits-linux
+# SUPERSTRIKE Control for Linux (GUI fork)
+
+A dark **GUI + system-tray app** for the **Logitech G PRO X2 / X3 SUPERSTRIKE** on Linux: click **actuation**,
+**click haptics**, **rapid trigger**, **DPI** and **polling rate (up to 8000 Hz)**, plus a background service
+that keeps your settings after the mouse sleeps. Works on **Arch / CachyOS** and **NixOS**.
+
+> This is a fork of [**kazehana99k/Logitech-PRO-X2-SUPERSTRIKE-Linux-haptics-actuation-control-**](https://github.com/kazehana99k/Logitech-PRO-X2-SUPERSTRIKE-Linux-haptics-actuation-control-).
+> All the HID++ reverse-engineering is kazehana99k's work. This fork adds the GUI, tray, DPI/polling-rate control,
+> the keep-settings service, and Arch + NixOS packaging. **Coded with Grok**, with [**SHAHEII**](https://github.com/SHAHEII)
+> as contributor and maintainer. See [Credits](#credits--contributors).
+
+> **Testing status:** HITS (actuation/haptics/rapid trigger) uses the original, hardware-tested protocol. The **X3**
+> support, **DPI**, **polling rate**, the **keep-settings-after-sleep service** and the **tray** are new and
+> **lightly tested on real hardware** (mostly with a simulated mouse in the test-suite). Please open an issue with
+> `superstrike-gui --diagnose` output if something doesn't work.
+
+![GUI](screenshots/screenshot-keep-settings-tray.png)
+
+## Installation
+
+### A) Arch Linux / CachyOS / Manjaro / EndeavourOS
+
+1. Get the code:
+   ```bash
+   git clone -b gui https://github.com/SHAHEII/Logitech-PRO-X2-SUPERSTRIKE-Linux-haptics-actuation-control-.git superstrike
+   cd superstrike
+   ```
+2. Install (asks for your sudo password once, for `pacman -S python pyside6` and the udev rules):
+   ```bash
+   ./install.sh
+   ```
+   This installs into your home folder: the app (`~/.local/share/superstrike-hits`), the commands
+   `superstrike-gui`, `superstrike-hits` and `superstrike-watch` (`~/.local/bin`), the app-menu entry
+   *SUPERSTRIKE Control*, the udev rules (so no root is needed for the mouse) and two systemd **user** services.
+3. **Unplug and replug the receiver/dongle once** (so the new udev permission applies).
+4. Open **SUPERSTRIKE Control** from the app menu (or run `~/.local/bin/superstrike-gui`).
+5. Set your DPI / polling rate / click settings. Then, on the **Saved config & background** tab:
+   * tick **Keep settings after sleep (background service)**. This saves your settings and turns on
+     `superstrike-watch.service`, so the DPI doesn't fall back to 800 after the mouse idles;
+   * optional: **Start minimized to tray at login**. *Closing the window keeps it in the tray* is on by default
+     (use **Quit** in the tray menu to really exit).
+6. Check that the service is running:
+   ```bash
+   systemctl --user status superstrike-watch.service
+   journalctl --user -u superstrike-watch -f      # move the mouse after it slept: "re-applied saved settings"
+   ```
+
+**Update:** `git pull && ./install.sh`. **Uninstall:** `./install.sh --uninstall` (keeps `~/.config/superstrike-hits.conf`).
+**Menu entry does nothing?** Run `~/.local/bin/superstrike-gui --diagnose` and look at `~/.cache/superstrike/gui.log`.
+`~/.local/bin` not in your PATH (only matters for typing commands)? fish: `fish_add_path ~/.local/bin`.
+
+### B) NixOS (flake)
+
+1. Add the flake to your system flake (`/etc/nixos/flake.nix`):
+   ```nix
+   {
+     inputs = {
+       nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+       superstrike = {
+         url = "github:SHAHEII/Logitech-PRO-X2-SUPERSTRIKE-Linux-haptics-actuation-control-/gui";
+         inputs.nixpkgs.follows = "nixpkgs";
+       };
+     };
+
+     outputs = { nixpkgs, superstrike, ... }: {
+       nixosConfigurations.my-pc = nixpkgs.lib.nixosSystem {   # use your hostname
+         system = "x86_64-linux";
+         modules = [
+           ./configuration.nix
+           superstrike.nixosModules.default
+         ];
+       };
+     };
+   }
+   ```
+2. Turn it on in `configuration.nix`:
+   ```nix
+   programs.superstrike = {
+     enable = true;              # package + app-menu entry + udev rules (no root needed)
+     watcher.enable = true;      # install the keep-settings-after-sleep user service (default)
+     watcher.autoStart = false;  # true = start it for every user at login; false = toggle it in the GUI
+     trayAtLogin = false;        # true = start the GUI minimized to the tray at login
+   };
+   ```
+3. Rebuild, then replug the receiver once:
+   ```bash
+   sudo nixos-rebuild switch --flake /etc/nixos#my-pc
+   ```
+4. Open **SUPERSTRIKE Control** from the app menu, set things up, and tick **Keep settings after sleep** (or set
+   `watcher.autoStart = true`). Check it with `systemctl --user status superstrike-watch.service`.
+
+| Option | Default | What it does |
+|---|---|---|
+| `programs.superstrike.enable` | `false` | installs `superstrike-gui`, `superstrike-hits`, `superstrike-watch`, the menu entry and icon |
+| `programs.superstrike.package` | this flake's package | package to use |
+| `programs.superstrike.udevRules` | `true` | udev rules: `uaccess` on the Logitech hidraw nodes + auto-apply hook on plug-in |
+| `programs.superstrike.watcher.enable` | `true` | ships `superstrike-watch.service` / `superstrike-apply.service` as systemd user units |
+| `programs.superstrike.watcher.autoStart` | `false` | `wantedBy = graphical-session.target` for every user (the GUI toggle then can't turn it off) |
+| `programs.superstrike.trayAtLogin` | `false` | system-wide XDG autostart of `superstrike-gui --tray` |
+
+**NixOS without flakes** (`configuration.nix`):
+```nix
+{
+  imports = [
+    "${builtins.fetchTarball "https://github.com/SHAHEII/Logitech-PRO-X2-SUPERSTRIKE-Linux-haptics-actuation-control-/archive/gui.tar.gz"}/nix/nixos.nix"
+  ];
+  programs.superstrike.enable = true;
+}
+```
+
+**Just try it** (any distro with Nix, no install): `nix run github:SHAHEII/Logitech-PRO-X2-SUPERSTRIKE-Linux-haptics-actuation-control-/gui`
+(you still need the udev rule or root to access the mouse). Without a mouse: `nix run ... -- --mock`.
+
+The flake also has `packages.<system>.default`, `overlays.default` (adds `pkgs.superstrike`) and `nix flake check`,
+which runs the whole test-suite and evaluates the module.
+
+### Other distros
+
+Copy the files and the udev rule by hand: you need Python 3 + PySide6, `42-logitech-superstrike.rules` in
+`/etc/udev/rules.d/`, and then run `python3 superstrike-gui.py`. The original CLI-only steps are below.
+
+---
+
+## Original project README (kazehana99k)
+
+### superstrike-hits-linux
 
 Control the **Logitech G PRO X2 SUPERSTRIKE** click-haptics and actuation points
 on **Linux**, without G HUB.
@@ -27,7 +152,7 @@ As of writing, neither **Solaar** nor **libratbag** supports this device's HITS 
   (Kernel `hid-logitech-dj` already exposes it; wired/direct should also work.)
 - Python 3.
 
-## Install
+## Install (original CLI-only method)
 
 ```bash
 git clone https://github.com/kazehana99k/Logitech-PRO-X2-SUPERSTRIKE-Linux-haptics-actuation-control-.git
@@ -57,7 +182,7 @@ applies them. Wire `--apply` to a udev/systemd hook so settings survive reboots 
 onboard profile being changed by Windows/G HUB. (See the repo wiki / issues for a sample
 systemd unit.)
 
-## GUI + CachyOS / Arch install (fork addition)
+## GUI details (fork addition)
 
 This fork adds **`superstrike-gui.py`**, a dark PySide6 window built on the functions in
 `superstrike-hits.py`, so it behaves exactly like the CLI:
@@ -72,17 +197,10 @@ This fork adds **`superstrike-gui.py`**, a dark PySide6 window built on the func
 
 Also: device picker (`--device`), a log panel, status and error messages, and a **system tray icon**. Mouse I/O runs in a background thread, so the window never freezes.
 
-### Install on CachyOS (fish is fine)
+### Install
 
-```bash
-git clone <your fork URL> superstrike && cd superstrike   # or untar the release
-./install.sh            # sudo pacman -S python pyside6, udev rules, ~/.local/bin launchers, systemd user unit
-# unplug + replug the receiver once
-superstrike-gui         # or "SUPERSTRIKE Control" in the app menu
-superstrike-hits --get  # CLI still works the same
-```
-If `~/.local/bin` is not in your PATH, fish users run `fish_add_path ~/.local/bin` (only needed for typing the commands;
-the app-menu entry uses an absolute path). To remove everything: `./install.sh --uninstall` (keeps your saved config).
+See [Installation](#installation) at the top (Arch/CachyOS and NixOS). Try the GUI without a mouse:
+`python3 superstrike-gui.py --mock`.
 
 ### "SUPERSTRIKE Control" in the app menu does nothing?
 
@@ -204,9 +322,11 @@ Where these come from:
 
 The X3 uses a new dongle **046d:c54f** (mouse WPID 40BE). According to Solaar PR #3352 (tested on a real X3),
 that dongle speaks HID++ 2.0 with the mouse at **device index 1**, and the same `0x1B0C` tuning works unchanged.
-This tool already tries index 1 first, on any Logitech hidraw node with the FF00 usage page. So the X3 *should*
-work as-is, but **nobody has tested it with this tool yet**. The fork only adds c54f to the udev permission and
-auto-apply rules. Nothing in the protocol code changed for it.
+This tool tries index 1 first, on any Logitech hidraw node with the FF00 usage page. On SHAHEII's real X3
+(CachyOS) it connected through the dongle in slot 1, with HITS at feature index 0x16 and DPI (`0x2202`, range
+100–48000), and setting DPI worked once the host-mode fix was added. Polling-rate changes, the keep-settings service and the
+tray are newer and have had little real-hardware testing so far. The fork adds c54f to the udev permission and
+auto-apply rules.
 
 ## How it works
 
@@ -220,10 +340,19 @@ captured from G HUB) are in **[PROTOCOL.md](PROTOCOL.md)**.
 - [ ] Upstream as a libratbag device entry and/or a Solaar feature plugin for `0x1B0C`.
 - [x] Packaged systemd/udev auto-apply (`install.sh`, toggle in the GUI).
 
-## Credits
+## Credits / Contributors
 
-Reverse-engineered by [**kazehana99k**](https://github.com/kazehana99k) (USBPcap
-differential capture of G HUB + on-device HID++ probing). Contributions / upstreaming welcome.
+* **Original project and all HID++ reverse-engineering:** [**kazehana99k**](https://github.com/kazehana99k), in
+  [kazehana99k/Logitech-PRO-X2-SUPERSTRIKE-Linux-haptics-actuation-control-](https://github.com/kazehana99k/Logitech-PRO-X2-SUPERSTRIKE-Linux-haptics-actuation-control-) (USBPcap differential capture of G HUB + on-device HID++ probing).
+  This fork is based on that project and keeps its MIT licence and copyright.
+* **GUI fork contributor and maintainer:** [**SHAHEII**](https://github.com/SHAHEII) (idea, requirements and testing on
+  a real PRO X3 SUPERSTRIKE under CachyOS).
+* **Coded with Grok:** the GUI, tray, DPI/polling-rate support, keep-settings service, Arch/NixOS packaging and
+  tests were written with Grok (commits carry `Co-authored-by: Grok`).
+* Protocol details for rapid trigger, DPI, report rate and the X3 dongle come from
+  [Solaar](https://github.com/pwr-Solaar/Solaar) (PRs #3132, #3207, #3352).
+
+Contributions / upstreaming welcome.
 
 ## Disclaimer
 
@@ -238,4 +367,4 @@ applicable to you.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE). Copyright (c) 2026 kazehana99k (original project); fork changes are released under the same MIT licence.
