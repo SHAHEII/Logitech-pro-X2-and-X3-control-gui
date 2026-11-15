@@ -65,6 +65,20 @@ def main(shots=None):
     w.dpi_same.setChecked(False); w.dpi_x.setValue(3210); w.dpi_y.setValue(1234); w.lod.setCurrentIndex(0)
     w.apply_dpi(); settle(app, w)
     assert fw.dpi == [3200, 1250, 0], fw.dpi
+    # polling rate tab
+    assert w.rate and w.rate["hz"] == 1000 and w.rate_presets.count() >= 7
+    w.rate_custom.setValue(3000); app.processEvents()
+    assert "snapped 3000 → 2000" in w.snap_lbl.text() and "2000 / 4000" in w.snap_lbl.text()
+    w.rate_custom.setValue(8000); app.processEvents()
+    assert "supported rate" in w.snap_lbl.text()
+    w.rate_custom.setValue(12000); assert w.rate_custom.value() == 8000  # capped
+    w.apply_rate(8000); settle(app, w)
+    assert fw.rate_idx == 6 and w.rate_cur.text() == "8000 Hz"
+    w.apply_rate(3000); settle(app, w)
+    assert fw.rate_idx == 4 and "isn't a hardware rate → using 2000" in w.log.toPlainText()
+    w.rate_custom.setValue(3000); app.processEvents()
+    if shots:
+        w.tabs.setCurrentIndex(2); settle(app, w); w.grab().save(os.path.join(shots, "screenshot-polling.png"))
     # config save / apply / auto
     w.save_cfg(); settle(app, w)
     assert os.path.exists(be.CONF)
@@ -77,7 +91,7 @@ def main(shots=None):
     w.dump(); settle(app, w)
     assert w.ftable.rowCount() == len(fw.features)
     if shots:
-        for i, name in enumerate(["hits", "dpi", "config", "features"]):
+        for i, name in [(0, "hits"), (1, "dpi"), (3, "config"), (4, "features")]:
             w.tabs.setCurrentIndex(i); settle(app, w)
             w.grab().save(os.path.join(shots, f"screenshot-{name}.png"))
     print("GUI offscreen test OK; log tail:\n" + "\n".join(w.log.toPlainText().splitlines()[-6:]))

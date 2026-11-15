@@ -147,3 +147,78 @@ def test_trace_hook(m):
     finally:
         be.TRACE = None
     assert lines[0].startswith(">> 11 01 0c 2") and any(l.startswith("<< 11 01 0c 2") for l in lines)
+
+
+def test_rate_read_uses_wireless_conn_byte(m):
+    be, dev, i, f, fw = m
+    fw.rate_idx = 6  # mouse really at 8000 Hz
+    r = be.read_rate(dev, i)
+    assert r["feature"] == 0x8061 and r["conn"] == 1 and r["hz"] == 8000
+    assert r["supported"] == [125, 250, 500, 1000, 2000, 4000, 8000]
+    assert (0x8061, 2, bytes([1, 0, 0, 0, 0, 0, 0, 0])) in fw.calls  # conn=1 sent (Solaar PR #3352)
+
+
+def test_rate_set_and_host_switch(m):
+    be, dev, i, f, fw = m
+    with pytest.raises(be.HidppError, match="onboard-profile mode, which owns polling rate"):
+        be.set_rate(dev, i, 8000, host_mode="never")
+    assert fw.rate_idx == 3
+    res = be.set_rate(dev, i, 8000)
+    assert res["hz"] == 8000 and res["switched_to_host"] and fw.rate_idx == 6
+    sent = [c for c in fw.calls if c[0] == 0x8061 and c[1] == 3][-1][2][0]
+    assert sent == 6  # index 6 = 125 us = 8000 Hz
+    for bad in (400, 3000, 9000, 0):
+        with pytest.raises(be.HidppError, match="not a rate"):
+            be.set_rate(dev, i, bad)
+
+
+def test_rate_snapping_and_cap():
+    be = M.load_backend()
+    sup = [125, 250, 500, 1000, 2000, 4000, 8000]
+    assert be.snap_rate(sup, 3000) == (2000, 2000, 4000)  # tie -> lower
+    assert be.snap_rate(sup, 3500) == (4000, 2000, 4000)
+    assert be.snap_rate(sup, 400) == (500, 250, 500)
+    assert be.snap_rate(sup, 99999) == (8000, 8000, 8000)  # capped at 8000
+    assert be.snap_rate(sup, 8000) == (8000, 8000, 8000)
+    assert be.snap_rate([125, 250, 500, 1000], 8000)[0] == 1000  # mouse without 8K
+
+
+def test_rate_unsupported_on_link(m):
+    be, dev, i, f, fw = m
+    fw.rate_flags[1] = 0x0F  # link that only goes to 1000 Hz
+    be.set_onboard_mode(dev, i, "host")
+    assert be.read_rate(dev, i)["supported"] == [125, 250, 500, 1000]
+    with pytest.raises(be.HidppError, match="not a rate"):
+        be.set_rate(dev, i, 8000)
+
+
+def test_rate_legacy_8060():
+    be, dev, i, f, fw = M.make_mock(rate_feature=0x8060)
+    r = be.read_rate(dev, i)
+    assert r["feature"] == 0x8060 and r["supported"] == [125, 250, 500, 1000] and r["hz"] == 1000
+    be.set_rate(dev, i, 250)
+    assert fw.rate_ms == 4
+
+
+def test_no_rate_feature():
+    be, dev, i, f, fw = M.make_mock(rate_feature=None)
+    assert be.read_rate(dev, i) is None
+
+
+def test_rate_in_config(m, tmp_path):
+    be, dev, i, f, fw = m
+    be.set_rate(dev, i, 4000)
+    path, cfg = be.save_config(dev, i, f, str(tmp_path / "c.conf"))
+    assert cfg["polling_hz"] == 4000
+    fw.rate_idx = 3; fw.onboard_mode = 1  # mouse power-cycled back to onboard profile
+    be.apply_config(dev, i, f, json.load(open(path)))
+    assert fw.rate_idx == 5 and fw.onboard_mode == 2
+    with pytest.raises(be.HidppError):
+        be.apply_config(dev, i, f, {"polling_hz": 9000})
+
+
+def test_cli_rate_validation():
+    import subprocess
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    r = subprocess.run([sys.executable, os.path.join(root, "superstrike-hits.py"), "--rate", "9000"], capture_output=True, text=True)
+    assert r.returncode != 0 and "1..8000" in r.stderr

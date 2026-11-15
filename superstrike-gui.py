@@ -42,6 +42,7 @@ QPushButton:disabled { color: #666; }
 QPushButton#primary { background: #0ea5e9; color: #0b0d10; border: none; font-weight: bold; }
 QPushButton#primary:hover { background: #38bdf8; }
 QPushButton#preset { padding: 4px 8px; }
+QPushButton#preset:checked { background: #0ea5e9; color: #0b0d10; border: none; font-weight: bold; }
 QTabWidget::pane { border: 1px solid #2c313a; border-radius: 8px; top: -1px; }
 QTabBar::tab { background: #1c1f26; padding: 8px 16px; border-top-left-radius: 8px; border-top-right-radius: 8px; margin-right: 2px; }
 QTabBar::tab:selected { background: #2a2f3a; color: #7dd3fc; }
@@ -125,6 +126,7 @@ class Main(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._hits_tab(), "Click (HITS)")
         self.tabs.addTab(self._dpi_tab(), "DPI")
+        self.tabs.addTab(self._rate_tab(), "Polling rate")
         self.tabs.addTab(self._config_tab(), "Saved config && auto-apply")
         self.tabs.addTab(self._features_tab(), "Feature table")
         self.log = QPlainTextEdit(readOnly=True)
@@ -309,6 +311,111 @@ class Main(QMainWindow):
         v.addStretch(1)
         return w
 
+    def _rate_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        box = QGroupBox("Polling rate (report rate)")
+        f = QFormLayout(box)
+        self.rate_cur = QLabel("-", objectName="big")
+        self.rate_info = QLabel("", objectName="muted")
+        f.addRow("Current", self.rate_cur)
+        f.addRow("", self.rate_info)
+        self.rate_presets_w = QWidget()
+        self.rate_presets = QHBoxLayout(self.rate_presets_w)
+        self.rate_presets.setContentsMargins(0, 0, 0, 0)
+        f.addRow("Presets", self.rate_presets_w)
+        crow = QHBoxLayout()
+        self.rate_custom = QSpinBox(minimum=1, maximum=8000, singleStep=100, suffix=" Hz")
+        self.rate_custom.setValue(1000)
+        self.rate_custom.setToolTip("Type any number up to 8000 Hz (the cap). The mouse only supports fixed hardware rates, "
+                                    "so the number is snapped to the nearest one it reports before anything is sent.")
+        self.rate_custom.valueChanged.connect(self.update_snap_label)
+        cb = QPushButton("Apply custom")
+        cb.setObjectName("primary")
+        cb.clicked.connect(lambda: self.apply_rate(self.rate_custom.value()))
+        crow.addWidget(self.rate_custom)
+        crow.addWidget(cb)
+        crow.addStretch(1)
+        f.addRow("Custom (max 8000)", crow)
+        self.snap_lbl = QLabel("", objectName="value")
+        f.addRow("", self.snap_lbl)
+        v.addWidget(box)
+        note = QLabel("HID++ only lets a mouse run at the fixed rates it reports, usually 125 / 250 / 500 / 1000 / 2000 / "
+                      "4000 / 8000 Hz. In-between numbers like 400 or 3000 Hz don't exist in the hardware, so a custom "
+                      "number is snapped to the nearest supported rate (a tie goes to the lower one) and only that "
+                      "rate is sent. 8000 Hz uses a lot more battery (Tom's Hardware: under 40 h on the X3). Like DPI, the "
+                      "rate is owned by the onboard profile, so the app switches to host mode first if "
+                      "'Switch to host mode automatically' on the DPI tab is ticked.", objectName="muted")
+        note.setWordWrap(True)
+        v.addWidget(note)
+        row = QHBoxLayout()
+        r = QPushButton("Read from mouse")
+        r.clicked.connect(self.read_rate)
+        row.addStretch(1)
+        row.addWidget(r)
+        v.addLayout(row)
+        v.addStretch(1)
+        self.rate = None
+        return w
+
+    def read_rate(self):
+        def ok(info):
+            self.rate = info
+            while self.rate_presets.count():
+                it = self.rate_presets.takeAt(0)
+                if it.widget():
+                    it.widget().deleteLater()
+            if not info:
+                self.rate_cur.setText("not supported")
+                return
+            link = "wired" if info["conn"] == 0 else "wireless"
+            self.rate_cur.setText(f"{info['hz']} Hz")
+            self.rate_info.setText(f"{link} link · supported: {', '.join(map(str, info['supported']))} Hz · "
+                                   f"HID++ 0x{info['feature']:04X}")
+            for hz in info["supported"]:
+                b = QPushButton(f"{hz}", objectName="preset")
+                b.setCheckable(True)
+                b.setChecked(hz == info["hz"])
+                b.clicked.connect(lambda _=False, hz=hz: self.apply_rate(hz))
+                self.rate_presets.addWidget(b)
+            if 400 not in info["supported"]:
+                self.rate_presets.addWidget(QLabel("(no 400 Hz in hardware)", objectName="muted"))
+            self.rate_presets.addStretch(1)
+            self.update_snap_label()
+            self.say(be.fmt_rate(info).strip())
+
+        self.run(lambda: be.read_rate(self.conn[0], self.conn[1]), ok)
+
+    def update_snap_label(self):
+        if not self.rate or not self.rate["supported"]:
+            self.snap_lbl.setText("")
+            return
+        want = self.rate_custom.value()
+        hz, lo, hi = be.snap_rate(self.rate["supported"], want)
+        if hz == want:
+            self.snap_lbl.setText(f"{want} Hz is a supported rate ✔")
+        else:
+            nb = " / ".join(str(x) for x in dict.fromkeys(v for v in (lo, hi) if v))
+            self.snap_lbl.setText(f"snapped {want} → {hz} Hz   (supported neighbours: {nb})")
+
+    def apply_rate(self, want):
+        if not self.rate:
+            return self.say("Polling rate not available on this device", True)
+        hz, lo, hi = be.snap_rate(self.rate["supported"], want)
+        if hz != want:
+            self.say(f"{want} Hz isn't a hardware rate → using {hz} Hz")
+        host_mode = "auto" if self.auto_host.isChecked() else "never"
+
+        def ok(res):
+            if res.get("switched_to_host"):
+                self.say("Switched the mouse to host mode so the polling rate can be changed "
+                         "(back to the onboard profile after power-off; enable auto-apply to keep it).")
+            self.say(f"Polling rate set to {res['hz']} Hz ✔")
+            self.read_rate()
+            self.read_dpi()
+
+        self.run(lambda: be.set_rate(self.conn[0], self.conn[1], hz, host_mode=host_mode), ok)
+
     def _config_tab(self):
         w = QWidget()
         v = QVBoxLayout(w)
@@ -412,6 +519,7 @@ class Main(QMainWindow):
             self.say(f"Connected to {name} on {dev.path}")
             self.read_hits()
             self.read_dpi()
+            self.read_rate()
 
         self.title.setText("Searching…")
         self.run(work, ok, need=False)
@@ -580,7 +688,8 @@ class Main(QMainWindow):
             be.apply_config(*self.conn, cfg)
             return cfg
 
-        self.run(work, lambda cfg: (self.say(f"Applied saved config: {json.dumps(cfg)}"), self.read_hits(), self.read_dpi()))
+        self.run(work, lambda cfg: (self.say(f"Applied saved config: {json.dumps(cfg)}"), self.read_hits(), self.read_dpi(),
+                                    self.read_rate()))
 
     def toggle_auto(self, on):
         try:

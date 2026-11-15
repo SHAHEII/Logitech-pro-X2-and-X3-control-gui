@@ -27,11 +27,18 @@ class _Refuse(Exception):
 
 
 class FakeFirmware:
-    def __init__(self, sock, dev_idx=1, name=b"PRO X2 SUPERSTRIKE", dpi_feature=0x2202):
+    def __init__(self, sock, dev_idx=1, name=b"PRO X2 SUPERSTRIKE", dpi_feature=0x2202, rate_feature=0x8061):
         self.sock, self.idx, self.name = sock, dev_idx, name
         self.features = [f if f != 0x2202 else dpi_feature for f in FEATURES]
         if dpi_feature is None:
             self.features = [f for f in FEATURES if f != 0x2202]
+        if rate_feature != 0x8061:
+            self.features = [f if f != 0x8061 else rate_feature for f in self.features if rate_feature or f != 0x8061]
+        # 0x8061 state: index 3 = 1000 Hz. X3: 8000 Hz wired + wireless (all 7 bits). wired_flags can be changed
+        # to emulate an X2 (8000 wireless, 1000 wired).
+        self.rate_idx = 3
+        self.rate_flags = {0: 0x7F, 1: 0x7F}
+        self.rate_ms = 1  # 0x8060 state
         self.rec = {0: [0x14, 0x09, 0x08], 1: [0x14, 0x09, 0x08], 2: [0x14, 0x09, 0x08]}  # act L5, x, hap L3
         self.dpi = [800, 800, 2]
         # like a real gaming mouse: starts in onboard-profile mode, where direct DPI writes are refused with
@@ -135,6 +142,32 @@ class FakeFirmware:
                     raise ValueError
                 self.dpi[0] = x
                 return b""
+        if fid == 0x8061:
+            if fn == 1:
+                return struct.pack(">H", self.rate_flags.get(p[0], 0))
+            if fn == 2:
+                if p[0] != (0 if self.idx == 0xFF else 1):
+                    return bytes([3])  # wrong link type -> answers for the other link (PR #3352 behaviour)
+                return bytes([self.rate_idx])
+            if fn == 3:
+                if self.onboard_mode == 1:
+                    raise _Refuse(5)
+                if p[0] > 6 or not self.rate_flags[0 if self.idx == 0xFF else 1] & (1 << p[0]):
+                    raise ValueError
+                self.rate_idx = p[0]
+                return b""
+        if fid == 0x8060:
+            if fn == 0:
+                return bytes([0x8B])  # 1, 2, 4, 8 ms
+            if fn == 1:
+                return bytes([self.rate_ms])
+            if fn == 2:
+                if self.onboard_mode == 1:
+                    raise _Refuse(5)
+                if p[0] not in (1, 2, 4, 8):
+                    raise ValueError
+                self.rate_ms = p[0]
+                return b""
         if fid == 0x8100:
             if fn == 1:
                 if p[0] not in (1, 2):
@@ -146,11 +179,11 @@ class FakeFirmware:
         return None
 
 
-def make_mock(backend=None, dev_idx=1, dpi_feature=0x2202):
+def make_mock(backend=None, dev_idx=1, dpi_feature=0x2202, rate_feature=0x8061):
     """-> (backend_module, device, dev_idx, analog_feature_index, firmware)."""
     be = backend or load_backend()
     a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-    fw = FakeFirmware(b, dev_idx, dpi_feature=dpi_feature)
+    fw = FakeFirmware(b, dev_idx, dpi_feature=dpi_feature, rate_feature=rate_feature)
 
     class MockDevice(be.Device):
         def __init__(self):

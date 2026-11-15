@@ -65,6 +65,7 @@ This fork adds **`superstrike-gui.py`**, a dark PySide6 window built on the func
 | Tab | What you can do |
 |---|---|
 | **Click (HITS)** | per-button **actuation** (1–10), **click haptics** (1–6, 1 = off), **rapid trigger** (1–5); link both buttons; defaults; read back; apply. Advanced: write raw bytes (`--raw-actuation` / `--raw-haptics`), checked against the device max and the multiple-of-4 rule |
+| **Polling rate** | current rate and link type, one-click presets for every rate the mouse reports (up to 8000 Hz), and a custom number box capped at 8000 that snaps to the nearest supported rate, shown as "snapped 3000 → 2000" |
 | **DPI** | current DPI, allowed range read from the mouse, X / Y / lift-off distance, presets 400–6400, values snapped to the mouse's steps |
 | **Saved config & auto-apply** | `--save` / `--apply` with one click, view the saved file, switch auto-apply on connect or login on and off |
 | **Feature table** | `--dump-features` as a table (0x1B0C highlighted) |
@@ -98,6 +99,18 @@ the same thing Solaar's "Onboard Profiles: Disabled" does) before writing DPI:
 
 Still failing? Turn on the GUI's *Debug: log raw HID++ frames* box, try again, press *Copy log* and send it,
 or run `superstrike-hits --trace --dpi 1600 2> dpi-trace.txt`.
+
+### Polling rate (up to 8000 Hz)
+
+* `--rate 8000`, `--rate-list`. In the GUI, use the *Polling rate* tab. HID++ `0x8061` (extended report rate), falling back to `0x8060`.
+* The mouse only runs at the **fixed rates it reports**. On the SUPERSTRIKE that's normally 125 / 250 / 500 / 1000 / 2000 / 4000 / 8000 Hz.
+  There's no 400 Hz or 3000 Hz in the hardware. Any number you type (capped at 8000) is snapped to the nearest
+  supported rate (a tie goes to the lower one), and only that rate is sent. Unsupported values are never sent.
+* The current rate is read with a "wireless" link byte when the mouse is behind a receiver or dongle. Solaar PR #3352
+  found that the X3 dongle otherwise answers for the wired link (it showed 1000 Hz while really at 8000).
+* Like DPI, the rate belongs to the onboard profile. The app switches to host mode first (see above), and
+  `--save` / auto-apply include `polling_hz`.
+* 8000 Hz drains the battery much faster (Tom's Hardware: under 40 h on the X3, compared with 135 h at 1000 Hz).
 
 ### New CLI options in this fork
 

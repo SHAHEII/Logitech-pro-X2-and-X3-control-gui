@@ -345,12 +345,12 @@ def _ensure_host_mode(dev, dev_idx, host_mode):
         return True
     return False
 
-def _dpi_write(dev, dev_idx, didx, fn, p):
+def _dpi_write(dev, dev_idx, didx, fn, p, what="DPI"):
     try:
         dev.request(dev_idx, didx, fn, p)
     except HidppError as e:
         if e.code == 5 and get_onboard_mode(dev, dev_idx) == "onboard":
-            raise HidppError(f"{e} - the mouse is in onboard-profile mode, which owns DPI. "
+            raise HidppError(f"{e} - the mouse is in onboard-profile mode, which owns {what}. "
                              "Switch to host mode (GUI button, or --onboard host) and retry.", code=5)
         raise
 
@@ -361,6 +361,90 @@ def fmt_dpi(info):
     if info["has_y"]: s += f"  Y {info['y']}"
     if info["has_lod"] and info["lod"] is not None: s += f"  lift-off {LOD_NAMES[info['lod']]}"
     return s + f"   (allowed {info['x_list'][0]}..{info['x_list'][-1]}, {len(info['x_list'])} values, feature 0x{info['feature']:04x})"
+
+# ---------------------------------------------------------------- polling / report rate (0x8061, fallback 0x8060)
+# 0x8061 (extended adjustable report rate) - wire format agreed by Solaar (ExtendedReportRate) and libratbag
+# (PR #1896, X2 support):  fn1 = supported-rate bitmask (BE16, bit i -> RATE_EXT_HZ[i]),
+# fn2(conn) = current rate index, fn3(index) = set.  conn: 0 = wired, 1 = LIGHTSPEED wireless.  Solaar
+# PR #3352 found that on the PRO X3 dongle the read MUST carry conn=1, otherwise the mouse answers for the
+# wired link (showed 1000 Hz while really at 8000 Hz).  We send conn for the list query too (libratbag does).
+# 0x8060 (older report rate, Solaar ReportRate): fn0 = bitmask (bit i -> (i+1) ms), fn1 = get ms, fn2 = set ms.
+# Only the discrete rates the mouse reports can be set - there is no "custom Hz" in HID++.
+RATE_EXT_FEATURE_ID, RATE_FEATURE_ID = 0x8061, 0x8060
+RATE_EXT_HZ = [125, 250, 500, 1000, 2000, 4000, 8000]
+RATE_MAX_HZ = 8000
+
+def find_rate_feature(dev, dev_idx):
+    for fid in (RATE_EXT_FEATURE_ID, RATE_FEATURE_ID):
+        try:
+            idx = dev.get_feature_index(dev_idx, fid)
+        except HidppError:
+            idx = 0
+        if idx:
+            return fid, idx
+    return None, 0
+
+def rate_connection(dev_idx):
+    """0 = wired/direct (device index 0xFF), 1 = wireless through a receiver/dongle."""
+    return 0 if dev_idx == 0xFF else 1
+
+def read_rate(dev, dev_idx):
+    """-> dict(feature, hz, supported=[Hz...], conn) or None if the mouse has no report-rate feature."""
+    fid, ridx = find_rate_feature(dev, dev_idx)
+    if not ridx:
+        return None
+    conn = rate_connection(dev_idx)
+    if fid == RATE_EXT_FEATURE_ID:
+        r = dev.request(dev_idx, ridx, 1, bytes([conn]))
+        flags = (r[0] << 8) | r[1]
+        supported = [hz for i, hz in enumerate(RATE_EXT_HZ) if flags & (1 << i)]
+        cur = dev.request(dev_idx, ridx, 2, bytes([conn]))[0]
+        hz = RATE_EXT_HZ[cur] if cur < len(RATE_EXT_HZ) else None
+    else:
+        flags = dev.request(dev_idx, ridx, 0)[0]
+        supported = sorted({1000 // (i + 1) for i in range(8) if flags & (1 << i)})
+        ms = dev.request(dev_idx, ridx, 1)[0]
+        hz = 1000 // ms if ms else None
+    return dict(feature=fid, hz=hz, supported=supported, conn=conn)
+
+def snap_rate(supported, want):
+    """Nearest supported rate to a custom number (capped at 8000). Ties go to the lower rate.
+    -> (snapped, lower_neighbour, upper_neighbour)."""
+    if not supported:
+        raise HidppError("the mouse reported no supported polling rates")
+    want = max(1, min(int(want), RATE_MAX_HZ))
+    lower = max([r for r in supported if r <= want], default=None)
+    upper = min([r for r in supported if r >= want], default=None)
+    snapped = min(supported, key=lambda r: (abs(r - want), r))
+    return snapped, lower, upper
+
+def set_rate(dev, dev_idx, hz, host_mode="auto"):
+    """Set an exact supported rate in Hz (use snap_rate for custom numbers). Never sends unsupported values."""
+    info = read_rate(dev, dev_idx)
+    if info is None:
+        raise HidppError("this device has no report-rate feature (0x8061 / 0x8060)")
+    if hz > RATE_MAX_HZ or hz not in info["supported"]:
+        raise HidppError(f"{hz} Hz is not a rate this mouse supports (supported: {info['supported']})")
+    fid, ridx = find_rate_feature(dev, dev_idx)
+    switched = _ensure_host_mode(dev, dev_idx, host_mode)
+    if fid == RATE_EXT_FEATURE_ID:
+        _dpi_write(dev, dev_idx, ridx, 3, bytes([RATE_EXT_HZ.index(hz)]), what="polling rate")
+    else:
+        _dpi_write(dev, dev_idx, ridx, 2, bytes([1000 // hz]), what="polling rate")
+    out = read_rate(dev, dev_idx)
+    out["switched_to_host"] = switched
+    if out["hz"] != hz:
+        mode = get_onboard_mode(dev, dev_idx)
+        raise HidppError(f"mouse accepted the command but still reports {out['hz']} Hz"
+                         + (" - it is in onboard-profile mode, switch to host mode" if mode == "onboard" else ""))
+    return out
+
+def fmt_rate(info):
+    if info is None:
+        return "  Polling rate: not available (no 0x8061/0x8060 feature)"
+    link = "wired" if info["conn"] == 0 else "wireless"
+    return (f"  Polling rate: {info['hz']} Hz ({link})   supported: "
+            + ", ".join(map(str, info["supported"])) + f"   (feature 0x{info['feature']:04x})")
 
 # ---------------------------------------------------------------- persistence (--save / --apply)
 def read_config(dev, dev_idx, fidx):
@@ -375,6 +459,12 @@ def read_config(dev, dev_idx, fidx):
         d = None
     if d:
         cfg["dpi"] = {"x": d["x"], "y": d["y"], "lod": d["lod"]}
+    try:
+        r = read_rate(dev, dev_idx)
+    except HidppError:
+        r = None
+    if r and r["hz"]:
+        cfg["polling_hz"] = r["hz"]
     return cfg
 
 def save_config(dev, dev_idx, fidx, path=None):
@@ -400,6 +490,11 @@ def apply_config(dev, dev_idx, fidx, cfg):
     if cfg.get("dpi"):
         d = cfg["dpi"]
         set_dpi(dev, dev_idx, d["x"], d.get("y"), d.get("lod"))
+    if cfg.get("polling_hz"):
+        hz = cfg["polling_hz"]
+        if not isinstance(hz, int) or not 1 <= hz <= RATE_MAX_HZ:
+            raise HidppError("polling_hz in config must be 1..8000")
+        set_rate(dev, dev_idx, hz)
 
 def main():
     ap = argparse.ArgumentParser(description="G PRO X2 SUPERSTRIKE click-haptics / actuation control (Linux)")
@@ -414,6 +509,9 @@ def main():
     ap.add_argument("--dpi", type=int, metavar="N", help="set DPI (snapped to the nearest value the mouse allows)")
     ap.add_argument("--dpi-y", type=int, metavar="N", help="separate Y-axis DPI (if the mouse supports it)")
     ap.add_argument("--lod", choices=["low", "medium", "high"], help="lift-off distance (with 0x2202)")
+    ap.add_argument("--rate", type=int, metavar="HZ",
+                    help="set polling rate (max 8000); other numbers snap to the nearest rate the mouse supports")
+    ap.add_argument("--rate-list", action="store_true", help="show current + supported polling rates")
     ap.add_argument("--dpi-list", action="store_true", help="print every DPI value the mouse accepts")
     ap.add_argument("--onboard", choices=["status", "host", "onboard"],
                     help="show / switch onboard-profile mode (host = software controls DPI until power-off)")
@@ -435,6 +533,8 @@ def main():
         raise SystemExit("rapid trigger must be 1..5")
     if args.dpi is not None and not 1 <= args.dpi <= 0xFFFF:
         raise SystemExit("dpi out of range")
+    if args.rate is not None and not 1 <= args.rate <= RATE_MAX_HZ:
+        raise SystemExit("polling rate must be 1..8000 Hz")
 
     global TRACE
     if args.trace:
@@ -456,6 +556,8 @@ def main():
 
         if args.dump_features:
             cmd_dump_features(dev, dev_idx); return
+        if args.rate_list:
+            print(fmt_rate(read_rate(dev, dev_idx))); return
         if args.dpi_list:
             d = read_dpi(dev, dev_idx)
             print(fmt_dpi(d))
@@ -497,9 +599,25 @@ def main():
             print(fmt_dpi(res).replace("DPI:", "set DPI:"))
             changed = True
 
+        if args.rate is not None:
+            cur = read_rate(dev, dev_idx)
+            if cur is None:
+                raise SystemExit("this device has no polling-rate feature")
+            hz, lo, hi = snap_rate(cur["supported"], args.rate)
+            if hz != args.rate:
+                print(f"  note: {args.rate} Hz is not a hardware rate; snapped to {hz} Hz "
+                      f"(nearest supported: {lo or '-'} / {hi or '-'})")
+            res = set_rate(dev, dev_idx, hz, host_mode="never" if args.no_host_switch else "auto")
+            if res.get("switched_to_host"):
+                print("  note: switched the mouse from onboard-profile mode to host mode so the rate can be set.\n"
+                      "        Host mode is lost when the mouse powers off; use --save + auto-apply to restore it.")
+            print(fmt_rate(res).replace("Polling rate:", "set polling rate:"))
+            changed = True
+
         if not changed and not args.save:
             cmd_get(dev, dev_idx, fidx)
             print(fmt_dpi(read_dpi(dev, dev_idx)))
+            print(fmt_rate(read_rate(dev, dev_idx)))
             print("  onboard-profile mode:", get_onboard_mode(dev, dev_idx) or "not supported")
             return
 
