@@ -13,6 +13,8 @@ Hardened vs the original:
 """
 import os, sys, glob, time, select, argparse, json, fcntl, contextlib
 
+__version__ = "1.0.1"
+
 VID, PID_RECEIVER = 0x046D, 0xC54D
 HIDPP_SHORT, HIDPP_LONG = 0x10, 0x11
 SHORT_LEN, LONG_LEN = 7, 20
@@ -341,67 +343,247 @@ def read_dpi(dev, dev_idx):
 def nearest_dpi(choices, want):
     return min(choices, key=lambda v: abs(v - want))
 
-# ---------------------------------------------------------------- onboard profiles mode (HID++ 0x8100)
-# Gaming mice run from an onboard profile by default ("onboard mode"). In that mode the profile owns
-# DPI / report rate, and a direct 0x2202 setSensorDpi is refused (seen on a real PRO X3 SUPERSTRIKE:
-# HID++ error 5). Solaar's docs say the same ("may need Onboard Profiles set to Disable"), and
-# libratbag never sends 0x2202 set while 0x8100 is present (it edits the profile instead).
-# Mode codes from Solaar's OnboardProfiles setting: fn1 setMode(1=onboard, 2=host), fn2 getMode.
+# ---------------------------------------------------------------- onboard profiles (HID++ 0x8100)
+# Gaming mice boot from an onboard profile ("onboard mode"). Direct 0x2202 / 0x8061 writes are
+# refused there (HID++ error 5 on a real PRO X SUPERSTRIKE). Switching to host mode avoids error 5
+# but on this firmware host mode stops the sensor from sending motion — the control channel stays
+# up, so the app can look successful while the pointer is dead.
+# The right fix, matching G HUB, is a read-modify-write of the active format-8 profile sector,
+# then staying in onboard mode. Host mode is only a fallback (unknown layout / write failure /
+# explicit request). HITS (0x1B0C) already stores on the mouse in both modes.
 ONBOARD_FEATURE_ID = 0x8100
 MODE_ONBOARD, MODE_HOST = 0x01, 0x02
+PROFILE_FORMAT_EXT = 8
+PROFILE_SLOTS = 5
+PROFILE_HEADER_LEN = 29
 
-def get_onboard_mode(dev, dev_idx):
-    """-> 'onboard', 'host', or None if the device has no 0x8100."""
+def crc16(data):
+    """CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, xorout 0). Same as Solaar logitech_receiver.common.crc16."""
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc
+
+def _onboard_index(dev, dev_idx):
     try:
         oidx = dev.get_feature_index(dev_idx, ONBOARD_FEATURE_ID)
     except HidppError:
-        return None
+        return 0
+    return oidx or 0
+
+def get_onboard_mode(dev, dev_idx):
+    """-> 'onboard', 'host', or None if the device has no 0x8100."""
+    oidx = _onboard_index(dev, dev_idx)
     if not oidx:
         return None
     m = dev.request(dev_idx, oidx, 2)[0]
     return "onboard" if m == MODE_ONBOARD else "host" if m == MODE_HOST else f"unknown({m})"
 
 def set_onboard_mode(dev, dev_idx, mode):
-    """mode: 'host' (software controls DPI; not kept across power cycles) or 'onboard' (profile controls DPI)."""
-    oidx = dev.get_feature_index(dev_idx, ONBOARD_FEATURE_ID)
+    """mode: 'host' (live DPI/rate writes; can freeze the SUPERSTRIKE pointer) or 'onboard' (profile owns DPI/rate)."""
+    oidx = _onboard_index(dev, dev_idx)
     if not oidx:
         raise HidppError("this device has no onboard profiles feature (0x8100)")
     dev.request(dev_idx, oidx, 1, bytes([MODE_HOST if mode == "host" else MODE_ONBOARD]))
     return get_onboard_mode(dev, dev_idx)
 
-def set_dpi(dev, dev_idx, x, y=None, lod=None, host_mode="auto"):
-    """Range-checked: x/y must be exact values from the mouse's own list (use nearest_dpi to snap)."""
+def get_onboard_info(dev, dev_idx):
+    """0x8100 fn0 getInfo -> dict(memory_model, profile_format, profile_count, sectors, sector_size)."""
+    oidx = _onboard_index(dev, dev_idx)
+    if not oidx:
+        raise HidppError("this device has no onboard profiles feature (0x8100)")
+    r = bytes(dev.request(dev_idx, oidx, 0))
+    if len(r) < 9:
+        raise HidppError("onboard getInfo returned a short payload")
+    return dict(memory_model=r[0], profile_format=r[1], profile_count=r[3],
+                sectors=r[6], sector_size=(r[7] << 8) | r[8], index=oidx)
+
+def current_profile_sector(dev, dev_idx, oidx=None):
+    oidx = oidx or _onboard_index(dev, dev_idx)
+    if not oidx:
+        raise HidppError("this device has no onboard profiles feature (0x8100)")
+    r = dev.request(dev_idx, oidx, 4)
+    return (r[0] << 8) | r[1]
+
+def read_profile_sector(dev, dev_idx, sector, size, oidx=None):
+    """Read a profile sector in 16-byte chunks. The last chunk uses Solaar's overlap read at size-16."""
+    oidx = oidx or _onboard_index(dev, dev_idx)
+    if not oidx:
+        raise HidppError("this device has no onboard profiles feature (0x8100)")
+    data = b""
+    off = 0
+    while off < size:
+        if off + 16 > size:
+            chunk_off = size - 16
+            chunk = bytes(dev.request(dev_idx, oidx, 5,
+                                      bytes([sector >> 8, sector & 0xFF, chunk_off >> 8, chunk_off & 0xFF]))[:16])
+            if len(chunk) < 16:
+                raise HidppError("short onboard sector read")
+            data += chunk[-(size - off):]
+            break
+        chunk = bytes(dev.request(dev_idx, oidx, 5,
+                                  bytes([sector >> 8, sector & 0xFF, off >> 8, off & 0xFF]))[:16])
+        if len(chunk) < 16:
+            raise HidppError("short onboard sector read")
+        data += chunk
+        off += 16
+    if len(data) != size:
+        raise HidppError(f"onboard sector length {len(data)} != {size}")
+    stored = (data[-2] << 8) | data[-1]
+    if crc16(data[:-2]) != stored:
+        raise HidppError(f"onboard sector CRC mismatch (stored 0x{stored:04x})")
+    return data
+
+def write_profile_sector(dev, dev_idx, sector, data, oidx=None):
+    """Write a sector with fn6 / fn7 / fn8. Last fn7 packet is padded to 16 zeros; the device keeps `len` bytes."""
+    oidx = oidx or _onboard_index(dev, dev_idx)
+    if not oidx:
+        raise HidppError("this device has no onboard profiles feature (0x8100)")
+    n = len(data)
+    dev.request(dev_idx, oidx, 6, bytes([sector >> 8, sector & 0xFF, 0, 0, n >> 8, n & 0xFF]))
+    for off in range(0, n, 16):
+        chunk = data[off:off + 16]
+        if len(chunk) < 16:
+            chunk = chunk + bytes(16 - len(chunk))
+        dev.request(dev_idx, oidx, 7, chunk)
+    dev.request(dev_idx, oidx, 8)
+
+def parse_ext_profile(sector):
+    """Parse a format-8 29-byte header. The rest of the sector is not interpreted."""
+    if len(sector) < PROFILE_HEADER_LEN:
+        raise HidppError("onboard sector shorter than the format-8 header")
+    slots = []
+    for i in range(PROFILE_SLOTS):
+        off = 4 + i * 5
+        x = int.from_bytes(sector[off:off + 2], "little")
+        y = int.from_bytes(sector[off + 2:off + 4], "little")
+        slots.append((x, y, sector[off + 4]))
+    return dict(wireless_idx=sector[0], wired_idx=sector[1], dpi_index=sector[2],
+                shift_index=sector[3], slots=slots)
+
+def _patch_ext_profile(sector, x=None, y=None, lod=None, rate_hz=None, conn=1):
+    """Copy the existing sector, patch the 29-byte header, rewrite CRC. Bytes 29..-3 stay untouched."""
+    data = bytearray(sector)
+    if rate_hz is not None:
+        if rate_hz not in RATE_EXT_HZ:
+            raise HidppError(f"{rate_hz} Hz has no format-8 rate index")
+        idx = RATE_EXT_HZ.index(rate_hz)
+        if conn == 0:
+            data[1] = idx
+        else:
+            data[0] = idx
+    if x is not None:
+        cur = parse_ext_profile(data)
+        dpi_index = cur["dpi_index"]
+        if not 0 <= dpi_index < PROFILE_SLOTS:
+            raise HidppError(f"onboard default DPI slot {dpi_index} out of range")
+        if lod is None:
+            lod = cur["slots"][dpi_index][2]
+        if y is None:
+            y = x
+        found = None
+        for i, (sx, sy, sl) in enumerate(cur["slots"]):
+            if sx == x and sy == y and sl == lod:
+                found = i
+                break
+        if found is not None:
+            data[2] = found
+        else:
+            off = 4 + dpi_index * 5
+            data[off:off + 2] = int(x).to_bytes(2, "little")
+            data[off + 2:off + 4] = int(y).to_bytes(2, "little")
+            data[off + 4] = lod
+    c = crc16(bytes(data[:-2]))
+    data[-2] = c >> 8
+    data[-1] = c & 0xFF
+    return bytes(data)
+
+def update_onboard_profile(dev, dev_idx, x=None, y=None, lod=None, rate_hz=None):
+    """Read-modify-write the active format-8 sector, then setMode onboard so live DPI/rate reload."""
+    info = get_onboard_info(dev, dev_idx)
+    if info["profile_format"] != PROFILE_FORMAT_EXT:
+        raise HidppError(f"onboard profile format {info['profile_format']} is not the verified format 8")
+    size = info["sector_size"]
+    oidx = info["index"]
+    sector = current_profile_sector(dev, dev_idx, oidx)
+    raw = read_profile_sector(dev, dev_idx, sector, size, oidx)
+    patched = _patch_ext_profile(raw, x=x, y=y, lod=lod, rate_hz=rate_hz, conn=rate_connection(dev_idx))
+    write_profile_sector(dev, dev_idx, sector, patched, oidx)
+    back = read_profile_sector(dev, dev_idx, sector, size, oidx)
+    if back != patched:
+        raise HidppError("onboard profile write did not stick (read-back mismatch)")
+    # always return to onboard so a mouse that was in host (which freezes this sensor) comes back
+    set_onboard_mode(dev, dev_idx, "onboard")
+    return parse_ext_profile(patched)
+
+def _try_onboard_write(dev, dev_idx, host_mode, x=None, y=None, lod=None, rate_hz=None):
+    """Write the format-8 profile when host_mode is auto/onboard. True if it stuck and we stayed onboard."""
+    if host_mode in ("never", "host"):
+        return False
+    if x is None and rate_hz is None:
+        return False
+    try:
+        update_onboard_profile(dev, dev_idx, x=x, y=y, lod=lod, rate_hz=rate_hz)
+        return True
+    except HidppError:
+        if host_mode == "onboard":
+            raise
+        return False
+
+def _checked_dpi(dev, dev_idx, x, y=None, lod=None):
+    """Validate x/y/lod against the mouse's lists. -> (info, x, y, lod) with defaults filled in."""
     info = read_dpi(dev, dev_idx)
     if info is None:
         raise HidppError("this device has no DPI feature (0x2202 / 0x2201)")
-    fid, didx = find_dpi_feature(dev, dev_idx)
     if x not in info["x_list"]:
         raise HidppError(f"DPI {x} not allowed (range {info['x_list'][0]}..{info['x_list'][-1]}, "
                          f"nearest {nearest_dpi(info['x_list'], x)})")
+    if info["feature"] == DPI_FEATURE_ID:
+        return info, x, None, None
+    y = x if y is None else y
+    if info["has_y"] and y not in info["y_list"]:
+        raise HidppError(f"Y DPI {y} not allowed")
+    if lod is not None and info["has_lod"] and lod not in (0, 1, 2):
+        raise HidppError("LOD must be 0 (LOW), 1 (MEDIUM) or 2 (HIGH)")
+    return info, x, y, lod
+
+def set_dpi(dev, dev_idx, x, y=None, lod=None, host_mode="auto"):
+    """Range-checked: x/y must be exact values from the mouse's own list (use nearest_dpi to snap).
+
+    host_mode: 'auto' (default) writes the onboard profile and stays onboard, falling back to host
+    if the profile write fails; 'onboard' writes the profile or raises; 'never' is a live HID++
+    write with no mode change (error 5 while onboard); 'host' switches to host, then live-writes.
+    """
+    info, x, y, lod = _checked_dpi(dev, dev_idx, x, y, lod)
+    fid, didx = find_dpi_feature(dev, dev_idx)
+    if _try_onboard_write(dev, dev_idx, host_mode, x=x, y=y, lod=lod):
+        out = read_dpi(dev, dev_idx)
+        out["wrote_onboard"] = True
+        out["switched_to_host"] = False
+        return out
     if fid == DPI_FEATURE_ID:
         switched = _ensure_host_mode(dev, dev_idx, host_mode)
         _dpi_write(dev, dev_idx, didx, 3, bytes([0, x >> 8, x & 0xFF]))
         out = read_dpi(dev, dev_idx)
+        out["wrote_onboard"] = False
         out["switched_to_host"] = switched
         return out
-    y = x if y is None else y
-    if info["has_y"] and y not in info["y_list"]:
-        raise HidppError(f"Y DPI {y} not allowed")
-    lod = info["lod"] if lod is None else lod
-    if info["has_lod"] and lod not in (0, 1, 2):
-        raise HidppError("LOD must be 0 (LOW), 1 (MEDIUM) or 2 (HIGH)")
+    live_lod = info["lod"] if lod is None else lod
     p = bytes([0, x >> 8, x & 0xFF])
     p += bytes([y >> 8, y & 0xFF]) if info["has_y"] else b"\x00\x00"
-    p += bytes([lod if info["has_lod"] else 0])
+    p += bytes([live_lod if info["has_lod"] and live_lod is not None else 0])
     switched = _ensure_host_mode(dev, dev_idx, host_mode)
     _dpi_write(dev, dev_idx, didx, 6, p)
     out = read_dpi(dev, dev_idx)
+    out["wrote_onboard"] = False
     out["switched_to_host"] = switched
     return out
 
 def _ensure_host_mode(dev, dev_idx, host_mode):
-    """host_mode='auto': leave onboard mode first if needed (returns True if it switched). 'never': don't."""
-    if host_mode != "auto":
+    """'auto' and 'host' may switch to host (returns True if they did). 'never' and 'onboard' must not."""
+    if host_mode not in ("auto", "host"):
         return False
     if get_onboard_mode(dev, dev_idx) == "onboard":
         set_onboard_mode(dev, dev_idx, "host")
@@ -481,20 +663,36 @@ def snap_rate(supported, want):
     snapped = min(supported, key=lambda r: (abs(r - want), r))
     return snapped, lower, upper
 
-def set_rate(dev, dev_idx, hz, host_mode="auto"):
-    """Set an exact supported rate in Hz (use snap_rate for custom numbers). Never sends unsupported values."""
+def _checked_rate(dev, dev_idx, hz):
+    """Validate hz against the rates the mouse reports. -> (info, hz)."""
     info = read_rate(dev, dev_idx)
     if info is None:
         raise HidppError("this device has no report-rate feature (0x8061 / 0x8060)")
     if hz > RATE_MAX_HZ or hz not in info["supported"]:
         raise HidppError(f"{hz} Hz is not a rate this mouse supports (supported: {info['supported']})")
+    return info, hz
+
+def set_rate(dev, dev_idx, hz, host_mode="auto"):
+    """Set an exact supported rate in Hz (use snap_rate for custom numbers). Never sends unsupported values.
+
+    host_mode has the same contract as set_dpi: auto writes the onboard profile and stays onboard.
+    """
+    info, hz = _checked_rate(dev, dev_idx, hz)
     fid, ridx = find_rate_feature(dev, dev_idx)
+    if _try_onboard_write(dev, dev_idx, host_mode, rate_hz=hz):
+        out = read_rate(dev, dev_idx)
+        out["wrote_onboard"] = True
+        out["switched_to_host"] = False
+        if out["hz"] != hz:
+            raise HidppError(f"onboard profile wrote {hz} Hz but the mouse still reports {out['hz']} Hz")
+        return out
     switched = _ensure_host_mode(dev, dev_idx, host_mode)
     if fid == RATE_EXT_FEATURE_ID:
         _dpi_write(dev, dev_idx, ridx, 3, bytes([RATE_EXT_HZ.index(hz)]), what="polling rate")
     else:
         _dpi_write(dev, dev_idx, ridx, 2, bytes([1000 // hz]), what="polling rate")
     out = read_rate(dev, dev_idx)
+    out["wrote_onboard"] = False
     out["switched_to_host"] = switched
     if out["hz"] != hz:
         mode = get_onboard_mode(dev, dev_idx)
@@ -550,14 +748,22 @@ def apply_config(dev, dev_idx, fidx, cfg):
                    act_raw=act_level_to_raw(c["actuation"]) if "actuation" in c else None,
                    hap_raw=hap_level_to_raw(c["haptics"]) if "haptics" in c else None,
                    rt_level=c.get("rapid_trigger"))
+    # DPI and polling rate: one format-8 profile RMW, stay onboard. Host-mode live writes only if that fails.
+    x = y = lod = rate_hz = None
     if cfg.get("dpi"):
         d = cfg["dpi"]
-        set_dpi(dev, dev_idx, d["x"], d.get("y"), d.get("lod"))
+        _info, x, y, lod = _checked_dpi(dev, dev_idx, d["x"], d.get("y"), d.get("lod"))
     if cfg.get("polling_hz"):
         hz = cfg["polling_hz"]
         if not isinstance(hz, int) or not 1 <= hz <= RATE_MAX_HZ:
             raise HidppError("polling_hz in config must be 1..8000")
-        set_rate(dev, dev_idx, hz)
+        _info, rate_hz = _checked_rate(dev, dev_idx, hz)
+    if x is not None or rate_hz is not None:
+        if not _try_onboard_write(dev, dev_idx, "auto", x=x, y=y, lod=lod, rate_hz=rate_hz):
+            if x is not None:
+                set_dpi(dev, dev_idx, x, y, lod, host_mode="host")
+            if rate_hz is not None:
+                set_rate(dev, dev_idx, rate_hz, host_mode="host")
 
 def main():
     ap = argparse.ArgumentParser(description="G PRO X2 SUPERSTRIKE click-haptics / actuation control (Linux)")
@@ -577,9 +783,9 @@ def main():
     ap.add_argument("--rate-list", action="store_true", help="show current + supported polling rates")
     ap.add_argument("--dpi-list", action="store_true", help="print every DPI value the mouse accepts")
     ap.add_argument("--onboard", choices=["status", "host", "onboard"],
-                    help="show / switch onboard-profile mode (host = software controls DPI until power-off)")
+                    help="show / switch onboard-profile mode (onboard = profile owns DPI; host = live writes, can freeze the pointer)")
     ap.add_argument("--no-host-switch", action="store_true",
-                    help="with --dpi: do NOT leave onboard-profile mode automatically")
+                    help="live HID++ write only (do not write the onboard profile or change profile mode)")
     ap.add_argument("--trace", action="store_true", help="print every raw HID++ frame (for bug reports)")
     ap.add_argument("--dump-features", action="store_true", help="print the whole HID++ feature table (self-check)")
     ap.add_argument("--device", help="explicit /dev/hidrawN (normally auto-detected)")
@@ -657,9 +863,12 @@ def main():
                 y = nearest_dpi(cur["y_list"], args.dpi_y) if args.dpi_y is not None else x
             lod = ("low", "medium", "high").index(args.lod) if args.lod else None
             res = set_dpi(dev, dev_idx, x, y, lod, host_mode="never" if args.no_host_switch else "auto")
+            if res.get("wrote_onboard"):
+                print("  note: wrote DPI into the onboard profile; it stays after sleep and the pointer keeps working.")
             if res.get("switched_to_host"):
-                print("  note: switched the mouse from onboard-profile mode to host mode so DPI can be set.\n"
-                      "        Host mode is lost when the mouse powers off; use --save + auto-apply to restore it.")
+                print("  note: switched the mouse to host mode so DPI can be set.\n"
+                      "        Host mode can freeze the SUPERSTRIKE pointer and is lost on power-off; "
+                      "use --save + auto-apply to restore it.")
             print(fmt_dpi(res).replace("DPI:", "set DPI:"))
             changed = True
 
@@ -672,9 +881,12 @@ def main():
                 print(f"  note: {args.rate} Hz is not a hardware rate; snapped to {hz} Hz "
                       f"(nearest supported: {lo or '-'} / {hi or '-'})")
             res = set_rate(dev, dev_idx, hz, host_mode="never" if args.no_host_switch else "auto")
+            if res.get("wrote_onboard"):
+                print("  note: wrote the polling rate into the onboard profile; it stays after sleep and the pointer keeps working.")
             if res.get("switched_to_host"):
-                print("  note: switched the mouse from onboard-profile mode to host mode so the rate can be set.\n"
-                      "        Host mode is lost when the mouse powers off; use --save + auto-apply to restore it.")
+                print("  note: switched the mouse to host mode so the rate can be set.\n"
+                      "        Host mode can freeze the SUPERSTRIKE pointer and is lost on power-off; "
+                      "use --save + auto-apply to restore it.")
             print(fmt_rate(res).replace("Polling rate:", "set polling rate:"))
             changed = True
 

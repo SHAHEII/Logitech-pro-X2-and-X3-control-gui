@@ -2,18 +2,20 @@
 """superstrike-watch - keeps your saved SUPERSTRIKE settings after the mouse sleeps / reconnects
 or the PC resumes from suspend.
 
-Why: after the mouse is idle it drops its LIGHTSPEED link; when it wakes up it reconnects in
-onboard-profile mode, so DPI / polling rate go back to the profile's values (e.g. 800 DPI).
-This watcher re-applies ~/.config/superstrike-hits.conf (host mode + DPI + polling + HITS) when:
+Why: DPI and polling rate are written into the onboard profile, so they normally survive sleep.
+This watcher is a safety net: it re-applies ~/.config/superstrike-hits.conf (HITS, and DPI/rate if
+they drifted from the saved config) when:
   * the receiver/dongle reports the mouse (re)connected  (HID++ 1.0 0x41 / HID++ 2.0 0x1D4B event,
     the same notifications Solaar uses to detect a reconnect),
   * a receiver/dongle hidraw node appears (plug-in, USB re-enumeration after resume),
   * the PC resumes from suspend (CLOCK_BOOTTIME jumps ahead of CLOCK_MONOTONIC),
-  * a cheap periodic check finds the mouse back in onboard mode (safety net, default every 30 s).
+  * a cheap periodic check finds live DPI/rate different from the saved config (default every 30 s).
 It only blocks in select() (no busy polling), opens hidraw read-only for listening, and takes the shared
 device lock while writing, so the GUI/tray keep working.  Runs as a systemd --user service.
 """
 import argparse, importlib.util, json, os, select, sys, time
+
+__version__ = "1.0.1"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -51,7 +53,7 @@ class Watcher:
         self.log = log
         self.scan = scan or be.hidpp_nodes
         self.open_listener = open_listener or (lambda p: os.open(p, os.O_RDONLY | os.O_NONBLOCK))
-        self.open_device = open_device or (lambda p: be.find_device(p))
+        self.open_device = open_device or (lambda p: be.find_device())  # scan all FF00 nodes; ignore the listener path
         self.clock = clock or (lambda: (_clock("CLOCK_MONOTONIC"), _clock("CLOCK_BOOTTIME")))
         self.fds = {}  # path -> fd
         self.status_idx = {}  # path -> 0x1D4B feature index (once known)
@@ -145,7 +147,7 @@ class Watcher:
         return False
 
     def verify(self):
-        """Safety net: if the mouse is in onboard mode but the config wants host-mode values, re-apply."""
+        """Safety net: compare live DPI/rate to the saved config. Matching onboard is success."""
         cfg = self.config()
         if not cfg or not (cfg.get("dpi") or cfg.get("polling_hz")):
             return
@@ -154,13 +156,26 @@ class Watcher:
                 with self.be.device_lock(timeout=2):
                     dev, idx, fidx = self.open_device(path)
                     try:
-                        mode = self.be.get_onboard_mode(dev, idx)
+                        drifted = False
+                        if cfg.get("dpi"):
+                            d = self.be.read_dpi(dev, idx)
+                            want = cfg["dpi"]
+                            if not d or d["x"] != want["x"]:
+                                drifted = True
+                            elif want.get("y") is not None and d.get("y") is not None and d["y"] != want["y"]:
+                                drifted = True
+                            elif want.get("lod") is not None and d.get("lod") is not None and d["lod"] != want["lod"]:
+                                drifted = True
+                        if cfg.get("polling_hz"):
+                            r = self.be.read_rate(dev, idx)
+                            if not r or r["hz"] != cfg["polling_hz"]:
+                                drifted = True
                     finally:
                         dev.close()
             except (self.be.HidppError, SystemExit, OSError):
                 continue  # mouse asleep / not there: fine, a reconnect notification will come
-            if mode == "onboard":
-                self.schedule("periodic check: mouse back in onboard mode", delay=0)
+            if drifted:
+                self.schedule("periodic check: DPI/rate drifted from saved config", delay=0)
             return
 
     def step(self, max_wait=None):
@@ -230,7 +245,7 @@ class Watcher:
 def main():
     ap = argparse.ArgumentParser(description="Re-apply saved SUPERSTRIKE settings after sleep/reconnect/resume")
     ap.add_argument("--verify-interval", type=float, default=30.0,
-                    help="seconds between safety-net checks of onboard mode (0 = off)")
+                    help="seconds between safety-net checks of live DPI/rate vs the saved config (0 = off)")
     ap.add_argument("--once", action="store_true", help="apply the saved config once and exit")
     ap.add_argument("--status", action="store_true", help="print the last status written by the running service")
     args = ap.parse_args()

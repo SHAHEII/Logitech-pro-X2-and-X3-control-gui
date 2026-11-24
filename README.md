@@ -1,8 +1,9 @@
-# SUPERSTRIKE Control for Linux (GUI fork)
+# SUPERSTRIKE Control for Linux (GUI fork) — v1.0.1
 
 A dark **GUI + system-tray app** for the **Logitech G PRO X2 / X3 SUPERSTRIKE** on Linux: click **actuation**,
 **click haptics**, **rapid trigger**, **DPI** and **polling rate (up to 8000 Hz)**, plus a background service
-that keeps your settings after the mouse sleeps. Works on **Arch / CachyOS** and **NixOS**.
+as a safety net after the mouse sleeps. DPI and polling rate are written into the mouse's
+**onboard profile**, so they survive sleep the same way G HUB does. Works on **Arch / CachyOS** and **NixOS**.
 
 > This is a fork of [**kazehana99k/Logitech-PRO-X2-SUPERSTRIKE-Linux-haptics-actuation-control-**](https://github.com/kazehana99k/Logitech-PRO-X2-SUPERSTRIKE-Linux-haptics-actuation-control-).
 > All the HID++ reverse-engineering is kazehana99k's work. This fork adds the GUI, tray, DPI/polling-rate control,
@@ -34,9 +35,10 @@ that keeps your settings after the mouse sleeps. Works on **Arch / CachyOS** and
    *SUPERSTRIKE Control*, the udev rules (so no root is needed for the mouse) and two systemd **user** services.
 3. **Unplug and replug the receiver/dongle once** (so the new udev permission applies).
 4. Open **SUPERSTRIKE Control** from the app menu (or run `~/.local/bin/superstrike-gui`).
-5. Set your DPI / polling rate / click settings. Then, on the **Saved config & background** tab:
-   * tick **Keep settings after sleep (background service)**. This saves your settings and turns on
-     `superstrike-watch.service`, so the DPI doesn't fall back to 800 after the mouse idles;
+5. Set your DPI / polling rate / click settings. DPI and polling rate are written into the mouse's
+   onboard profile, so they stay after sleep. Then, on the **Saved config & background** tab:
+   * optional: tick **Keep settings after sleep (background service)**. This is a safety net: it
+     re-applies HITS, and DPI/rate if they ever drifted, after idle / reconnect / resume;
    * optional: **Start minimized to tray at login**. *Closing the window keeps it in the tray* is on by default
      (use **Quit** in the tray menu to really exit).
 6. Check that the service is running:
@@ -217,28 +219,29 @@ KDE Plasma's menu doesn't read your fish/bash config, so the launch failed silen
 
 Just re-run `./install.sh` after updating.
 
-### DPI goes back to 800 after the mouse has been idle? → "Keep settings after sleep"
+### DPI / polling rate persistence (onboard profile) and "Keep settings after sleep"
 
-Cause: DPI / polling rate are only writable in **host mode** (see error 5 below). When the mouse idles it drops the
-LIGHTSPEED link to save power; when you move it again it reconnects and boots on its **onboard profile** (e.g. 800 DPI),
-forgetting host mode. The same happens when the PC suspends and the USB dongle is reset.
+DPI and polling rate are persisted by a **read-modify-write of the active format-8 onboard profile**
+(HID++ `0x8100`, CRC-16/CCITT-FALSE), then staying in onboard mode — the same approach G HUB uses.
+That keeps the SUPERSTRIKE pointer working and survives sleep. Only format 8 is written; unknown
+layouts fall back to host mode. The rest of the 255-byte sector (buttons / macros) is copied unchanged.
 
-Fix: *Saved config & background* tab → tick **Keep settings after sleep (background service)**. This enables
-`superstrike-watch.service` (a systemd `--user` service, ~0 % CPU) that re-applies your saved config
-(host mode + DPI + polling rate + click settings) when:
+`superstrike-watch.service` is a **safety net**, not the persistence design. Tick **Keep settings after sleep
+(background service)** on the *Saved config & background* tab to enable it (a systemd `--user` service, ~0 % CPU).
+It re-applies HITS, and DPI/rate if they drifted from the saved config, when:
 
 * the dongle reports the mouse **reconnected**: HID++ 1.0 `0x41` connect notification or the HID++ 2.0 `0x1D4B`
   "wireless device status: reconfiguration needed" event (the same signals Solaar uses);
 * a receiver `hidraw` node **appears** again (plug-in, USB reset after resume); a node that disappears is dropped and
-  re-scanned every 3 s;
+  re-scanned every 3 s. Writes always **scan for the HID++ (FF00) node** rather than opening the listener path,
+  which after USB re-enumeration can be a different hidraw device;
 * the **PC resumes** from suspend (detected by `CLOCK_BOOTTIME` jumping ahead of `CLOCK_MONOTONIC`);
-* a light safety-net check (every 30 s: ping + read profile mode) finds the mouse back in onboard mode.
+* a light safety-net check (every 30 s) finds live DPI/rate different from the saved config.
 
 It just sleeps in `select()` on the hidraw node (no busy polling) and only opens it read-only to listen. All writes,
 from the service, the GUI and the tray, take one shared lock (`$XDG_RUNTIME_DIR/superstrike.lock`), so they never
 interleave. While the service is on, every change you apply in the GUI/tray is saved automatically so it restores the
-latest values. If you switch back to the onboard profile while it's on, it will put host mode back on the next wake;
-turn it off if you want the onboard profile.
+latest values. If you switch to onboard while it's on, a later re-apply is an onboard profile write, not a host switch.
 
 ```bash
 systemctl --user status superstrike-watch.service     # running?
@@ -246,11 +249,6 @@ journalctl --user -u superstrike-watch -f              # watch it re-apply when 
 superstrike-watch --status                             # last re-apply / error (JSON)
 superstrike-watch --once                               # apply the saved config once, now
 ```
-
-**Why not write the DPI into the onboard profile instead?** That would survive sleep with no service, but the X3's
-onboard-profile memory format (`0x8100` sectors, CRC, the new "GPX2" layout) is not verified: libratbag's support
-for this family (PR #1896) was never merged, and no one has tested profile writes on this mouse with any Linux tool. A wrong write can corrupt a profile and leave the mouse with odd DPI/buttons until G HUB repairs it, so
-this tool deliberately doesn't do it.
 
 ### System tray
 
@@ -272,16 +270,18 @@ Try the GUI without a mouse: `python3 superstrike-gui.py --mock`.
 
 ### DPI says "hid++ error 5 (LOGITECH_INTERNAL) … fn=6"?
 
-That's the mouse refusing DPI changes because it's in **onboard-profile mode**: its stored profile owns DPI.
-This was seen on a real PRO X3 SUPERSTRIKE. The fix switches the mouse to **host mode** (HID++ `0x8100` setMode 2,
-the same thing Solaar's "Onboard Profiles: Disabled" does) before writing DPI:
+That's the mouse refusing a **live** DPI/rate write because it's in **onboard-profile mode**. This was seen on
+a real SUPERSTRIKE. The default fix is **not** to switch to host mode: host mode can freeze the SUPERSTRIKE
+pointer (the control channel stays up, so the app can look successful while the cursor is dead). Instead the
+app writes the format-8 onboard profile and stays onboard.
 
-* GUI: *DPI* tab → "Switch to host mode automatically when applying DPI" (on by default), or the
-  *Switch to host mode* / *Back to onboard profile* buttons.
-* CLI: `--dpi` switches automatically (`--no-host-switch` turns that off), and `--onboard status|host|onboard` shows or sets the mode.
-* Host mode is **lost when the mouse powers off, sleeps or reconnects**. Save your settings and turn on
-  **Keep settings after sleep** (above) to restore them automatically.
-  In host mode the onboard profile's button mapping and DPI stages don't apply. HITS click settings are kept in both modes.
+* GUI: *DPI* tab → "Write DPI and polling rate into the onboard profile" (on by default). Untick it for a
+  live HID++ write only (that still hits error 5 while onboard). The *Switch to host mode* /
+  *Back to onboard profile* buttons are still there; host mode can freeze the pointer.
+* CLI: `--dpi` / `--rate` write the onboard profile (`--no-host-switch` is a live HID++ write only).
+  `--onboard status|host|onboard` shows or sets the mode.
+* Host mode is only used if the profile layout is not format 8 (or a profile write fails), or if you ask
+  for it explicitly. It is **lost when the mouse powers off** and can freeze the pointer.
 
 Still failing? Turn on the GUI's *Debug: log raw HID++ frames* box, try again, press *Copy log* and send it,
 or run `superstrike-hits --trace --dpi 1600 2> dpi-trace.txt`.
@@ -294,8 +294,7 @@ or run `superstrike-hits --trace --dpi 1600 2> dpi-trace.txt`.
   supported rate (a tie goes to the lower one), and only that rate is sent. Unsupported values are never sent.
 * The current rate is read with a "wireless" link byte when the mouse is behind a receiver or dongle. Solaar PR #3352
   found that the X3 dongle otherwise answers for the wired link (it showed 1000 Hz while really at 8000).
-* Like DPI, the rate belongs to the onboard profile. The app switches to host mode first (see above), and
-  `--save` / auto-apply include `polling_hz`.
+* Like DPI, the rate is written into the onboard profile (see above). `--save` / auto-apply include `polling_hz`.
 * 8000 Hz drains the battery much faster (Tom's Hardware: under 40 h on the X3, compared with 135 h at 1000 Hz).
 
 ### New CLI options in this fork
@@ -306,7 +305,7 @@ or run `superstrike-hits --trace --dpi 1600 2> dpi-trace.txt`.
 ./superstrike-hits.py --dpi 1600 --dpi-y 1200 --lod low
 ./superstrike-hits.py --dpi-list                   # every DPI the mouse accepts
 ./superstrike-hits.py --dump-features              # documented in PROTOCOL.md, now implemented
-./superstrike-hits.py --onboard status             # onboard-profile vs host mode (host = DPI can be set)
+./superstrike-hits.py --onboard status             # onboard-profile vs host mode (host can freeze the pointer)
 ./superstrike-hits.py --trace --get                # print raw HID++ frames (for bug reports)
 ./superstrike-hits.py --raw-actuation 0x10 --raw-haptics 0x0c --left
 ```

@@ -14,7 +14,7 @@ let
 in
 stdenvNoCC.mkDerivation {
   pname = "superstrike-hits";
-  version = "0.4.0";
+  version = "1.0.1";
 
   src = lib.cleanSourceWith {
     src = ../.;

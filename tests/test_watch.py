@@ -45,7 +45,7 @@ def test_startup_applies_once(env):
     w.rescan()  # node appears -> scheduled (2 s delay); shorten for the test
     w.pending = (time.monotonic(), w.pending[1], 3)
     assert run_until(w, lambda: fw.dpi[0] == 1600)
-    assert fw.onboard_mode == 2 and fw.rate_idx == 6
+    assert fw.onboard_mode == 1 and fw.rate_idx == 6
 
 
 @pytest.mark.parametrize("kind", ["1d4b", "41"])
@@ -55,9 +55,10 @@ def test_reconnect_notification_reapplies(env, kind):
     w.pending = None
     w.status_idx["/dev/hidraw4"] = fw.features.index(0x1D4B)  # learned after first connect
     fw.sleep_and_wake(kind)
-    assert fw.dpi[0] == 800 and fw.onboard_mode == 1  # the bug: back at 800 in onboard mode
-    assert run_until(w, lambda: fw.dpi[0] == 1600)
-    assert fw.onboard_mode == 2 and fw.rate_idx == 6 and fw.rec[0][0] == 0x08
+    # fixture already wrote 1600/8000 into the sector, so sleep stays there
+    assert fw.dpi[0] == 1600 and fw.onboard_mode == 1
+    assert run_until(w, lambda: w.applies >= 1)
+    assert fw.onboard_mode == 1 and fw.dpi[0] == 1600 and fw.rate_idx == 6 and fw.rec[0][0] == 0x08
     assert any("mouse reconnected" in l for l in logs)
     assert json.load(open(watch.status_path()))["state"] == "ok"
 
@@ -109,19 +110,65 @@ def test_resume_from_suspend_detected(env):
     assert run_until(w, lambda: fw.dpi[0] == 1600)
 
 
-def test_periodic_verify_catches_onboard(env):
+def test_verify_matching_onboard_is_success(env):
     be, dev, idx, fidx, fw, w, nodes, logs = env
     w.rescan(); w.pending = None
-    fw.sleep_and_wake(kind="none")
+    fw.sleep_and_wake(kind="none")  # still 1600/8000 from the patched sector
     w.verify()
-    assert w.pending and "onboard" in w.pending[1]
+    assert w.pending is None
+
+
+def test_verify_schedules_on_dpi_drift(env):
+    be, dev, idx, fidx, fw, w, nodes, logs = env
+    w.rescan(); w.pending = None
+    fw.dpi = [800, 800, 2]  # smash live values without touching the sector
+    w.verify()
+    assert w.pending and "drifted" in w.pending[1]
+
+
+def test_watch_writes_profile_after_host_only_sleep(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    be, dev, idx, fidx, fw = M.make_mock()
+    be.set_dpi(dev, idx, 1600, 1600, 2, host_mode="host")
+    be.set_rate(dev, idx, 8000, host_mode="host")
+    be.set_button(dev, idx, fidx, 0, 0x08, 0x00, 1)
+    conf = str(tmp_path / "superstrike-hits.conf")
+    be.save_config(dev, idx, fidx, conf)
+    assert fw.onboard_mode == 2 and fw.dpi[0] == 1600
+    fw.sleep_and_wake("none")
+    assert fw.dpi[0] == 800 and fw.rate_idx == 3 and fw.onboard_mode == 1  # factory sector unchanged
+    logs = []
+    nodes = {"/dev/hidraw4": fw.add_listener()}
+    w = watch.Watcher(be, conf=conf, verify_interval=0, settle=0.05, log=logs.append,
+                      scan=lambda: list(nodes), open_listener=lambda p: nodes[p],
+                      open_device=lambda p: (dev, idx, fidx))
+    w.rescan()
+    w.pending = (time.monotonic(), w.pending[1], 3)
+    assert run_until(w, lambda: fw.dpi[0] == 1600 and fw.onboard_mode == 1)
+    assert fw.rate_idx == 6 and be.parse_ext_profile(fw.sectors[1])["dpi_index"] == 1
+
+
+def test_default_open_device_scans_not_listener_path():
+    be, dev, idx, fidx, fw = M.make_mock()
+    called = []
+
+    def spy(*args, **kwargs):
+        called.append((args, kwargs))
+        return dev, idx, fidx
+
+    be.find_device = spy
+    w = watch.Watcher(be, conf="/dev/null", verify_interval=0, log=lambda m: None,
+                      scan=lambda: [], open_listener=lambda p: None)
+    w.open_device("/dev/hidraw3")
+    assert called == [((), {})]  # find_device() with no path
 
 
 def test_no_config_does_nothing(env, tmp_path):
     be, dev, idx, fidx, fw, w, nodes, logs = env
     w.conf = str(tmp_path / "missing.conf")
-    fw.sleep_and_wake(kind="none")
-    assert w.apply_now("x") and fw.dpi[0] == 800
+    before = (fw.dpi[0], fw.rate_idx, fw.onboard_mode, bytes(fw.sectors[1]))
+    assert w.apply_now("x")
+    assert (fw.dpi[0], fw.rate_idx, fw.onboard_mode, bytes(fw.sectors[1])) == before
 
 
 def test_lock_serialises(env):

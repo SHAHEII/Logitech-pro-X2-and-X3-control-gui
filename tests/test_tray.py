@@ -74,7 +74,7 @@ def test_tray_menu_and_presets(ui):
     assert w.act_status.text() == "800 DPI · 1000 Hz" and not w.act_status.isEnabled()
     assert "4000 Hz" in actions(w.rate_menu) and "8000 Hz" in actions(w.rate_menu)
     actions(w.dpi_menu)["1600 DPI"].trigger(); settle(app, w)
-    assert fw.dpi[0] == 1600 and fw.dpi[1] == 1600 and fw.onboard_mode == 2
+    assert fw.dpi[0] == 1600 and fw.dpi[1] == 1600 and fw.onboard_mode == 1
     actions(w.rate_menu)["8000 Hz"].trigger(); settle(app, w)
     assert fw.rate_idx == 6
     assert w.act_status.text() == "1600 DPI · 8000 Hz"
@@ -87,9 +87,9 @@ def test_reapply_from_tray(ui):
     app, w, fw, sc = ui
     actions(w.dpi_menu)["1600 DPI"].trigger(); settle(app, w)
     w.save_cfg(); settle(app, w)
-    fw.sleep_and_wake("none")  # mouse woke up at 800 in onboard mode
+    fw.sleep_and_wake("none")  # sector already has 1600; stays onboard
     w.act_reapply.trigger(); settle(app, w)
-    assert fw.dpi[0] == 1600 and fw.onboard_mode == 2
+    assert fw.dpi[0] == 1600 and fw.onboard_mode == 1
 
 
 def test_close_to_tray_and_quit(ui):

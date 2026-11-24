@@ -79,6 +79,7 @@ fi
 
 echo
 echo "Done. Unplug + replug the receiver once, then start 'SUPERSTRIKE Control' from the app menu"
-echo "(or run: $BIN/superstrike-gui). In the 'Saved config' tab tick"
-echo "  'Keep settings after sleep (background service)'  -> stops the DPI going back to 800 after idle"
+echo "(or run: $BIN/superstrike-gui). DPI and polling rate are written into the mouse's onboard profile,"
+echo "so they stay after sleep. Optional safety net: in the 'Saved config' tab tick"
+echo "  'Keep settings after sleep (background service)'  -> re-applies HITS, and DPI/rate if they ever drift"
 echo "If the menu entry still does nothing: $BIN/superstrike-gui --diagnose   (log: ~/.cache/superstrike/gui.log)"

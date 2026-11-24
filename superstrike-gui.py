@@ -10,6 +10,8 @@ Run:  superstrike-gui  [--tray] [--mock] [--diagnose]
 """
 import glob, importlib.util, json, logging, logging.handlers, os, shutil, subprocess, sys, traceback
 
+__version__ = "1.0.1"
+
 CACHE_DIR = os.path.expanduser("~/.cache/superstrike")
 LOG_FILE = os.path.join(CACHE_DIR, "gui.log")
 APP_ID = "superstrike-gui"
@@ -256,7 +258,7 @@ class Main(QMainWindow):
         self.dpi = None
         self.pool = QThreadPool()
         self.pool.setMaxThreadCount(1)  # one HID++ transaction at a time
-        self.setWindowTitle("SUPERSTRIKE Control")
+        self.setWindowTitle("SUPERSTRIKE Control 1.0.1")
         self.resize(860, 800)
 
         root = QWidget()
@@ -431,13 +433,14 @@ class Main(QMainWindow):
         mrow.addWidget(self.host_btn)
         mrow.addWidget(self.onb_btn)
         mf.addLayout(mrow)
-        self.auto_host = QCheckBox("Switch to host mode automatically when applying DPI")
+        self.auto_host = QCheckBox("Write DPI and polling rate into the onboard profile")
         self.auto_host.setChecked(True)
         mf.addWidget(self.auto_host)
-        mnote = QLabel("In <b>onboard</b> mode the mouse's stored profile owns DPI, and the mouse refuses DPI changes "
-                       "(HID++ error 5). <b>Host</b> mode lets this app set DPI, but the mouse goes back to its onboard "
-                       "profile when it powers off. Auto-apply (next tab) restores your DPI on every connect. "
-                       "Click (HITS) settings are stored on the mouse in both modes.", objectName="muted")
+        mnote = QLabel("The <b>onboard profile</b> is how this mouse keeps the pointer working: DPI and polling rate "
+                       "are written into it and stay after sleep. Untick the box for a live HID++ write only "
+                       "(the mouse refuses that in onboard mode with HID++ error 5). <b>Host</b> mode can freeze "
+                       "the SUPERSTRIKE pointer and is lost on power-off. Click (HITS) settings are stored on the "
+                       "mouse in both modes.", objectName="muted")
         mnote.setWordWrap(True)
         mf.addWidget(mnote)
         v.addWidget(mbox)
@@ -489,8 +492,8 @@ class Main(QMainWindow):
                       "4000 / 8000 Hz. In-between numbers like 400 or 3000 Hz don't exist in the hardware, so a custom "
                       "number is snapped to the nearest supported rate (a tie goes to the lower one) and only that "
                       "rate is sent. 8000 Hz uses a lot more battery (Tom's Hardware: under 40 h on the X3). Like DPI, the "
-                      "rate is owned by the onboard profile, so the app switches to host mode first if "
-                      "'Switch to host mode automatically' on the DPI tab is ticked.", objectName="muted")
+                      "rate is stored in the onboard profile when 'Write DPI and polling rate into the onboard "
+                      "profile' on the DPI tab is ticked (the default). Host mode can freeze the pointer.", objectName="muted")
         note.setWordWrap(True)
         v.addWidget(note)
         row = QHBoxLayout()
@@ -554,9 +557,11 @@ class Main(QMainWindow):
         host_mode = "auto" if self.auto_host.isChecked() else "never"
 
         def ok(res):
+            if res.get("wrote_onboard"):
+                self.say("Wrote the polling rate into the onboard profile (stays after sleep; pointer keeps working).")
             if res.get("switched_to_host"):
-                self.say("Switched the mouse to host mode so the polling rate can be changed "
-                         "(back to the onboard profile when the mouse sleeps; turn on 'Keep settings after sleep' to keep it).")
+                self.say("Switched the mouse to host mode so the polling rate can be changed. "
+                         "Host mode can freeze the SUPERSTRIKE pointer and is lost on power-off.")
             self.say(f"Polling rate set to {res['hz']} Hz ✔")
             self.read_rate()
             self.read_dpi()
@@ -597,7 +602,8 @@ class Main(QMainWindow):
         b3 = QVBoxLayout(box3)
         self.keep = QCheckBox("Keep settings after sleep (background service)")
         self.keep.setToolTip("Runs superstrike-watch.service: when the mouse wakes up / reconnects or the PC resumes, "
-                             "it re-applies your saved config (host mode, DPI, polling rate, click settings).")
+                             "it re-applies HITS, and DPI/rate if they drifted from the saved config. "
+                             "DPI and polling rate also live in the onboard profile.")
         self.keep.clicked.connect(self.toggle_keep)
         b3.addWidget(self.keep)
         self.svc_lbl = QLabel("service: ?", objectName="muted")
@@ -608,9 +614,9 @@ class Main(QMainWindow):
         rb.clicked.connect(self.refresh_service_status)
         r3.addWidget(rb)
         b3.addLayout(r3)
-        lab = QLabel("Re-applies your saved config when the mouse wakes up/reconnects or the PC resumes "
-                     "(it otherwise falls back to its onboard profile, e.g. 800 DPI). Changes you apply are saved "
-                     "automatically while this is on.", objectName="muted")
+        lab = QLabel("Safety net: re-applies HITS, and DPI/rate if they drifted, when the mouse wakes up, "
+                     "reconnects, or the PC resumes. DPI and polling rate also live in the onboard profile, so they "
+                     "normally survive sleep on their own. Changes you apply are saved automatically while this is on.", objectName="muted")
         lab.setWordWrap(True)
         b3.addWidget(lab)
         v.addWidget(box3)
@@ -832,11 +838,14 @@ class Main(QMainWindow):
         def ok(m):
             self._mode = m
             self.refresh_mode()
-            self.say(f"Profile mode is now: {m}" + ("  (DPI can be set; lost when the mouse sleeps unless 'Keep settings after sleep' is on)" if m == "host" else ""))
+            if m == "host":
+                self.say("Profile mode is now: host. Warning: host mode can freeze the SUPERSTRIKE pointer "
+                         "and is lost on power-off.")
+            else:
+                self.say(f"Profile mode is now: {m}")
             if m == "onboard" and self.keep.isChecked():
-                self.say("Note: 'Keep settings after sleep' is on, so the background service will switch the mouse "
-                         "back to host mode with your saved DPI/rate on the next wake-up. Turn it off to use the "
-                         "onboard profile.", True)
+                self.say("Note: 'Keep settings after sleep' is on, so the background service will re-apply "
+                         "the saved config as an onboard profile write (not a host switch) if DPI/rate drift.")
             self.read_dpi()
 
         self.run(work, ok)
@@ -859,9 +868,11 @@ class Main(QMainWindow):
         host_mode = "auto" if self.auto_host.isChecked() else "never"
 
         def ok(res):
+            if res.get("wrote_onboard"):
+                self.say("Wrote DPI into the onboard profile (stays after sleep; pointer keeps working).")
             if res.get("switched_to_host"):
-                self.say("Switched the mouse from onboard-profile mode to host mode so DPI can be changed. "
-                         "It returns to the onboard profile when the mouse sleeps/reconnects; turn on 'Keep settings after sleep' (Saved config tab) to keep your DPI.")
+                self.say("Switched the mouse to host mode so DPI can be changed. "
+                         "Host mode can freeze the SUPERSTRIKE pointer and is lost on power-off.")
             self.say(f"DPI set to {x}" + (f" / {y}" if y and y != x else "") + " ✔")
             self.read_dpi()
             self.autosave()
@@ -1079,6 +1090,7 @@ def diagnose(out=print):
     """Plain-text report for when the app-menu entry does nothing. Needs no display and no PySide6."""
     ok = lambda b: "OK  " if b else "FAIL"
     out("SUPERSTRIKE Control diagnostics")
+    out(f"  app           {__version__}")
     out(f"  python        {sys.executable} {sys.version.split()[0]}")
     out(f"  PySide6       {ok(PYSIDE_ERROR is None)} {PYSIDE_ERROR or ''}"
         + ("  -> sudo pacman -S pyside6" if PYSIDE_ERROR else ""))

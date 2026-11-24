@@ -55,11 +55,11 @@ def main(shots=None):
     w.debug.setChecked(False)
     if shots:
         w.tabs.setCurrentIndex(1); settle(app, w); w.grab().save(os.path.join(shots, "screenshot-dpi-error5-before.png"))
-    # fixed path: auto host switch on
+    # fixed path: write the onboard profile (checkbox on)
     w.auto_host.setChecked(True)
     w.dpi_preset(1600); settle(app, w)
     assert fw.dpi[:2] == [1600, 1600], fw.dpi
-    assert fw.onboard_mode == 2 and w.mode_lbl.text() == "mode: host" and "Switched the mouse" in w.log.toPlainText()
+    assert fw.onboard_mode == 1 and w.mode_lbl.text() == "mode: onboard" and "onboard profile" in w.log.toPlainText()
     w.set_mode("onboard"); settle(app, w); assert fw.onboard_mode == 1
     w.set_mode("host"); settle(app, w); assert fw.onboard_mode == 2
     w.dpi_same.setChecked(False); w.dpi_x.setValue(3210); w.dpi_y.setValue(1234); w.lod.setCurrentIndex(0)
